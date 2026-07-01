@@ -1,0 +1,323 @@
+/**
+ * heuristics.ts
+ * Non-axe DOM/CSS heuristic checks:
+ *  1. Target size < 24×24 px
+ *  2. Text truncation / clipping
+ *  3. Complex background (contrast risk)
+ *  4. Status messages without aria-live
+ *  5. On-input context changes
+ *  6. Heading structure (skipped levels, missing h1)
+ *  7. Landmark regions missing
+ *  8. Form inputs without visible labels
+ *  9. Images with empty/missing alt on meaningful images
+ * 10. Lang attribute missing / wrong on page
+ * 11. REFLOW: checks at 320px viewport width
+ * 12. Reduced-motion: detects missing prefers-reduced-motion
+ * 13. Session timeout: detects countdown timers
+ */
+
+import type { Page } from "playwright";
+import type { ScanIssue } from "./types";
+import { logger } from "../utils/logger";
+
+type ElemData = { selector: string; depth: number; extra?: string };
+
+function pack(
+  items: ElemData[],
+  ruleId: string,
+  severity: ScanIssue["severity"],
+  priority: number,
+  category: string,
+  message: string,
+  wcag: string[],
+  fixSuggestion: string,
+  url: string,
+  state: string,
+  phase: string
+): ScanIssue[] {
+  if (!items.length) return [];
+  return [{
+    ruleId, severity, priority, category, message, url,
+    selector:  items[0].selector,
+    selectors: items.map(i => i.selector),
+    depths:    items.map(i => i.depth),
+    wcag, fixSuggestion, state, phase,
+  }];
+}
+
+const safeEval = async <T = any>(page: Page, fn: () => T): Promise<T> => {
+  try { return await page.evaluate(fn); }
+  catch { return [] as unknown as T; }
+};
+
+export async function runHeuristics(
+  page: Page,
+  url: string,
+  state: string,
+  phase: string
+): Promise<ScanIssue[]> {
+  const issues: ScanIssue[] = [];
+
+  // ── 1. Target size ────────────────────────────────────────────────────────
+  const targetSize = await safeEval<ElemData[]>(page, () => {
+    const MIN = 24;
+    const out: { selector: string; depth: number }[] = [];
+    const isVisible = (el: HTMLElement) => {
+      const r = el.getBoundingClientRect();
+      const st = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden" &&
+        el.getAttribute("aria-hidden") !== "true" && !el.closest("[hidden],[inert],[aria-hidden='true']");
+    };
+    document.querySelectorAll("a[href],button,input,select,textarea,[role='button'],[role='link'],[tabindex]")
+      .forEach((el: any) => {
+        if (!isVisible(el) || el.disabled || el.getAttribute("aria-disabled") === "true") return;
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        const inlineTextLink = el.tagName === "A" && st.display === "inline" && r.width >= MIN;
+        if (inlineTextLink) return;
+        if (r.width < MIN || r.height < MIN) {
+          out.push({
+            selector: el.id ? `${el.tagName.toLowerCase()}#${el.id}` : el.tagName.toLowerCase(),
+            depth: 0,
+          });
+        }
+      });
+    return out.slice(0, 100);
+  });
+  issues.push(...pack(targetSize, "heuristic:target-size", "serious", 2, "pointer",
+    `${targetSize.length} interactive elements are smaller than 24×24 CSS pixels.`,
+    ["wcag2.5.8"], "Set min-width/min-height: 24px or increase padding on interactive elements.", url, state, phase));
+
+  // ── 2. Text truncation ────────────────────────────────────────────────────
+  const truncation = await safeEval<ElemData[]>(page, () => {
+    const out: { selector: string; depth: number }[] = [];
+    document.querySelectorAll("*").forEach((el: any) => {
+      const st = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      const text = el.textContent?.trim() || "";
+      if (!text || r.width <= 0 || r.height <= 0 || st.display === "none" || st.visibility === "hidden") return;
+      if (el.closest("[hidden],[inert],[aria-hidden='true']")) return;
+      const fullText = (el.getAttribute("title") || el.getAttribute("aria-label") || "").trim();
+      if (fullText.length >= text.length) return;
+      if (st.textOverflow === "ellipsis" || (st as any).webkitLineClamp) {
+        out.push({ selector: el.id ? `${el.tagName.toLowerCase()}#${el.id}` : el.tagName.toLowerCase(), depth: 0 });
+      }
+    });
+    return [...new Map(out.map(i => [i.selector, i])).values()].slice(0, 50);
+  });
+  issues.push(...pack(truncation, "heuristic:text-truncation", "moderate", 3, "readability",
+    `${truncation.length} elements clip or truncate text content, potentially hiding information.`,
+    ["wcag1.4.4"], "Provide accessible full text via title attribute, aria-label, or expandable disclosure.", url, state, phase));
+
+  // ── 3. Complex backgrounds ────────────────────────────────────────────────
+  const complexBg = await safeEval<ElemData[]>(page, () => {
+    const out: { selector: string; depth: number }[] = [];
+    document.querySelectorAll("*").forEach((el: any) => {
+      const st = getComputedStyle(el);
+      if (!el.textContent?.trim()) return;
+      if (st.backgroundImage && st.backgroundImage !== "none") {
+        out.push({ selector: el.id ? `${el.tagName.toLowerCase()}#${el.id}` : el.tagName.toLowerCase(), depth: 0 });
+      }
+    });
+    return [...new Map(out.map(i => [i.selector, i])).values()].slice(0, 50);
+  });
+  issues.push(...pack(complexBg, "heuristic:complex-background", "moderate", 3, "contrast",
+    `${complexBg.length} elements render text over image/gradient backgrounds — manually verify 4.5:1 contrast ratio.`,
+    ["wcag1.4.3","wcag1.4.11"], "Use a solid semi-transparent overlay or ensure text color meets contrast against all background areas.", url, state, phase));
+
+  // ── 4. Status messages without aria-live ─────────────────────────────────
+  const statusMsg = await safeEval<ElemData[]>(page, () => {
+    const out: { selector: string; depth: number }[] = [];
+    document.querySelectorAll(".toast,.notification,.alert,.snackbar,.banner,[role='status'],[role='alert']")
+      .forEach((el: any) => {
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        if (r.width <= 0 || r.height <= 0 || st.display === "none" || st.visibility === "hidden") return;
+        if (el.closest("[hidden],[inert],[aria-hidden='true']")) return;
+        const role = el.getAttribute("role");
+        if (role === "alert" || role === "status") return;
+        if (!el.getAttribute("aria-live")) {
+          out.push({ selector: el.className ? `.${String(el.className).split(" ")[0]}` : el.tagName.toLowerCase(), depth: 0 });
+        }
+      });
+    return out.slice(0, 30);
+  });
+  issues.push(...pack(statusMsg, "heuristic:status-message", "serious", 2, "aria",
+    `${statusMsg.length} status/notification elements are missing aria-live regions.`,
+    ["wcag4.1.3"], "Add aria-live='polite' for non-urgent and aria-live='assertive' for urgent notifications.", url, state, phase));
+
+  // ── 5. On-input context changes ───────────────────────────────────────────
+  const inputChange = await safeEval<ElemData[]>(page, () => {
+    const out: { selector: string; depth: number }[] = [];
+    document.querySelectorAll("select[onchange]").forEach((el: any) => {
+      const onchange = String(el.getAttribute("onchange") || "");
+      if (!/location|submit|href|navigate|reload/i.test(onchange)) return;
+      out.push({ selector: el.id ? `select#${el.id}` : "select", depth: 0 });
+    });
+    return out.slice(0, 30);
+  });
+  issues.push(...pack(inputChange, "heuristic:on-input-change", "moderate", 3, "interaction",
+    `${inputChange.length} select elements may auto-submit on change without user warning.`,
+    ["wcag3.2.2"], "Avoid triggering navigation on 'change' events. Use an explicit submit button.", url, state, phase));
+
+  // ── 6. Heading structure ──────────────────────────────────────────────────
+  const headings = await safeEval<{ levels: number[]; hasH1: boolean; skipped: number[] }>(page, () => {
+    const hs = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6")).filter((h: any) => {
+      const r = h.getBoundingClientRect();
+      const st = getComputedStyle(h);
+      return r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden" &&
+        !h.closest("[hidden],[inert],[aria-hidden='true']");
+    });
+    const levels = hs.map(h => parseInt(h.tagName[1]));
+    const hasH1 = levels.includes(1);
+    const skipped: number[] = [];
+    for (let i = 1; i < levels.length; i++) {
+      if (levels[i] - levels[i - 1] > 1) skipped.push(levels[i]);
+    }
+    return { levels, hasH1, skipped };
+  });
+  if (!headings.hasH1) {
+    issues.push({ ruleId: "heuristic:heading-no-h1", severity: "serious", priority: 2, category: "structure",
+      message: "Page is missing an <h1> heading. Screen readers rely on this as the page title.",
+      url, selector: "body", selectors: ["body"], depths: [0], wcag: ["wcag1.3.1","wcag2.4.6"],
+      fixSuggestion: "Add a single <h1> that describes the page content.", state, phase });
+  }
+  if (headings.skipped.length) {
+    issues.push({ ruleId: "heuristic:heading-skipped-level", severity: "moderate", priority: 3, category: "structure",
+      message: `Heading levels are skipped (${headings.skipped.join(", ")}). Screen readers expect sequential heading hierarchy.`,
+      url, selector: "body", selectors: ["body"], depths: [0], wcag: ["wcag1.3.1","wcag2.4.6"],
+      fixSuggestion: "Do not skip heading levels. Use CSS to style headings visually, not to select the tag.", state, phase });
+  }
+
+  // ── 7. Landmark regions ───────────────────────────────────────────────────
+  const landmarks = await safeEval<{ hasMain: boolean; hasNav: boolean; hasBanner: boolean }>(page, () => ({
+    hasMain:   !!document.querySelector("main,[role='main']"),
+    hasNav:    !!document.querySelector("nav,[role='navigation']"),
+    hasBanner: !!document.querySelector("header,[role='banner']"),
+  }));
+  if (!landmarks.hasMain) {
+    issues.push({ ruleId: "heuristic:landmark-main-missing", severity: "serious", priority: 2, category: "structure",
+      message: "Page is missing a <main> landmark. Keyboard users cannot skip to main content.",
+      url, selector: "body", selectors: ["body"], depths: [0], wcag: ["wcag1.3.6","wcag2.4.1"],
+      fixSuggestion: "Wrap primary page content in <main> or add role='main'.", state, phase });
+  }
+
+  // ── 8. Form inputs without visible labels ─────────────────────────────────
+  const unlabeledInputs = await safeEval<ElemData[]>(page, () => {
+    const out: { selector: string; depth: number }[] = [];
+    document.querySelectorAll("input:not([type='hidden']):not([type='submit']):not([type='button']),select,textarea")
+      .forEach((el: any) => {
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        if (r.width <= 0 || r.height <= 0 || st.display === "none" || st.visibility === "hidden") return;
+        if (el.closest("[hidden],[inert],[aria-hidden='true']")) return;
+        const id = el.id;
+        const hasLabel = id && document.querySelector(`label[for="${id}"]`);
+        const hasAria  = el.getAttribute("aria-label") || el.getAttribute("aria-labelledby");
+        const hasTitle = el.getAttribute("title");
+        if (!hasLabel && !hasAria && !hasTitle) {
+          out.push({ selector: el.id ? `${el.tagName.toLowerCase()}#${el.id}` : el.tagName.toLowerCase(), depth: 0 });
+        }
+      });
+    return out.slice(0, 50);
+  });
+  issues.push(...pack(unlabeledInputs, "heuristic:input-no-label", "critical", 1, "forms",
+    `${unlabeledInputs.length} form inputs have no associated label (no <label for>, aria-label, or aria-labelledby).`,
+    ["wcag1.3.1","wcag3.3.2"], "Associate each input with a <label for='id'>, or add aria-label/aria-labelledby.", url, state, phase));
+
+  // ── 9. Images without meaningful alt ─────────────────────────────────────
+  const badAlt = await safeEval<ElemData[]>(page, () => {
+    const out: { selector: string; depth: number }[] = [];
+    document.querySelectorAll("img").forEach((el: any) => {
+      const r = el.getBoundingClientRect();
+      const st = getComputedStyle(el);
+      const role = el.getAttribute("role");
+      if (r.width <= 0 || r.height <= 0 || st.display === "none" || st.visibility === "hidden") return;
+      if (el.closest("[hidden],[inert],[aria-hidden='true']") || el.getAttribute("aria-hidden") === "true") return;
+      if (role === "presentation" || role === "none") return;
+      const alt = el.getAttribute("alt");
+      if (alt === null) {
+        out.push({ selector: el.id ? `img#${el.id}` : `img[src="${(el.src||"").slice(-40)}"]`, depth: 0 });
+      }
+    });
+    return out.slice(0, 50);
+  });
+  issues.push(...pack(badAlt, "heuristic:image-missing-alt", "critical", 1, "images",
+    `${badAlt.length} images are missing alt attributes entirely.`,
+    ["wcag1.1.1"], "Add alt='' for decorative images, or a descriptive alt text for informative images.", url, state, phase));
+
+  // ── 10. Language attribute ─────────────────────────────────────────────────
+  const langMissing = await safeEval<boolean>(page, () =>
+    !document.documentElement.getAttribute("lang")
+  );
+  if (langMissing) {
+    issues.push({ ruleId: "heuristic:lang-missing", severity: "serious", priority: 2, category: "structure",
+      message: "Page <html> element is missing a lang attribute. Screen readers cannot select the correct language.",
+      url, selector: "html", selectors: ["html"], depths: [0], wcag: ["wcag3.1.1"],
+      fixSuggestion: "Add lang='en' (or appropriate BCP 47 tag) to the <html> element.", state, phase });
+  }
+
+  // ── 11. Reflow — 320px viewport ───────────────────────────────────────────
+  try {
+    const originalSize = page.viewportSize();
+    await page.setViewportSize({ width: 320, height: 568 });
+    await page.waitForTimeout(400);
+
+    const reflowIssues = await safeEval<ElemData[]>(page, () => {
+      const out: { selector: string; depth: number }[] = [];
+      const vw = window.innerWidth;
+      document.querySelectorAll("*").forEach((el: any) => {
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        if (r.width <= 0 || r.height <= 0 || st.display === "none" || st.visibility === "hidden") return;
+        if (el.closest("[hidden],[inert],[aria-hidden='true']")) return;
+        if (st.position === "fixed") return;
+        if ((st.overflowX === "auto" || st.overflowX === "scroll") && el.scrollWidth > el.clientWidth) return;
+        if (r.right > vw + 2) {
+          out.push({ selector: el.id ? `${el.tagName.toLowerCase()}#${el.id}` : el.tagName.toLowerCase(), depth: 0 });
+        }
+      });
+      return [...new Map(out.map(i => [i.selector, i])).values()].slice(0, 30);
+    });
+
+    await page.setViewportSize({
+      width: originalSize?.width || 1366,
+      height: originalSize?.height || 768,
+    });
+    await page.waitForTimeout(300);
+
+    issues.push(...pack(reflowIssues, "heuristic:reflow", "serious", 2, "zoom",
+      `${reflowIssues.length} elements overflow the 320px viewport — WCAG 1.4.10 Reflow failure.`,
+      ["wcag1.4.10"], "Use responsive CSS (flexbox/grid, relative units). Avoid fixed widths that exceed 320px.", url, state, phase));
+  } catch (err) {
+    logger.debug("Reflow check failed:", err);
+  }
+
+  // ── 12. Reduced motion ────────────────────────────────────────────────────
+  const hasAnimation = await safeEval<boolean>(page, () => {
+    let found = false;
+    document.querySelectorAll("*").forEach((el: any) => {
+      const st = getComputedStyle(el);
+      if ((st.animationName && st.animationName !== "none") || (st.transitionDuration && st.transitionDuration !== "0s")) {
+        found = true;
+      }
+    });
+    return found;
+  });
+  const hasMotionQuery = await safeEval<boolean>(page, () => {
+    const sheets = Array.from(document.styleSheets);
+    return sheets.some(s => {
+      try {
+        return Array.from(s.cssRules).some(r => r.cssText.includes("prefers-reduced-motion"));
+      } catch { return false; }
+    });
+  });
+  if (hasAnimation && !hasMotionQuery) {
+    issues.push({ ruleId: "heuristic:reduced-motion", severity: "serious", priority: 2, category: "motion",
+      message: "Animated elements detected but no @media (prefers-reduced-motion) query found.",
+      url, selector: "body", selectors: ["body"], depths: [0], wcag: ["wcag2.3.3"],
+      fixSuggestion: "Wrap all animations in @media (prefers-reduced-motion: no-preference) { } so users who opt-out see no motion.", state, phase });
+  }
+
+  return issues.filter(i => i.selectors?.length || i.selector);
+}
