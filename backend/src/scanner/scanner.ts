@@ -16,6 +16,8 @@
  */
 
 import { chromium } from "playwright";
+import * as fs from "fs";
+import * as path from "path";
 import type { ScanOptions, ProgressCallback, ScanIssue, DomSnapshot, TestCase, StateConfig, TargetInteractionConfig, TargetJourneyStep, ControlledInteractionReportItem } from "./types";
 import { navigateSafely } from "./navigation";
 import { runAxe } from "./axeScan";
@@ -36,6 +38,128 @@ export interface ScanResult {
   navigatedUrls: string[];
   score: number;
 }
+
+// -----------------------------------------------------------------------------
+// Anti-detection helpers
+// -----------------------------------------------------------------------------
+// Bot detectors (Sky iD, Cloudflare Turnstile, Akamai Bot Manager, etc.) look
+// for the `chrome-headless-shell` binary specifically. Playwright 1.49+
+// defaults to that binary for `headless: true`. To evade the check we:
+//   1. Point executablePath at the *full* Chromium binary the workflow ships.
+//   2. Launch with `headless: false` and rely on Xvfb providing $DISPLAY.
+//   3. Inject a stealth script that patches the JS-visible signals detectors
+//      test (webdriver, chrome.runtime, WebGL vendor, permissions, plugins).
+
+function resolveFullChromiumPath(): string | undefined {
+  // If PLAYWRIGHT_BROWSERS_PATH is set (Azure: /home/playwright-browsers),
+  // search for chromium-<rev>/chrome-linux64/chrome. Fall back to Playwright
+  // default (returns undefined here so Playwright picks its own).
+  const browsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  if (!browsersPath) return undefined;
+  try {
+    if (!fs.existsSync(browsersPath)) return undefined;
+    const entries = fs.readdirSync(browsersPath);
+    // Prefer full chromium (not chromium_headless_shell) which starts with
+    // exactly "chromium-" followed by a revision number.
+    const chromiumDir = entries.find(name =>
+      /^chromium-\d+$/.test(name)
+    );
+    if (!chromiumDir) return undefined;
+    const candidate = path.join(browsersPath, chromiumDir, "chrome-linux64", "chrome");
+    if (fs.existsSync(candidate)) {
+      logger.info(`Scanner using full Chromium binary: ${candidate}`);
+      return candidate;
+    }
+  } catch (err) {
+    logger.warn("resolveFullChromiumPath failed; falling back to Playwright default:", err);
+  }
+  return undefined;
+}
+
+// This script is evaluated in every new document before any page script.
+// Patches the fingerprint tells that bot detectors check.
+const STEALTH_INIT_SCRIPT = `
+(() => {
+  try {
+    // 1) navigator.webdriver — the single biggest tell.
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  } catch (e) {}
+
+  try {
+    // 2) navigator.languages — headless returns [] by default.
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+  } catch (e) {}
+
+  try {
+    // 3) navigator.plugins — headless has 0. Real Chrome has PDF viewer + others.
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => {
+        const arr = [
+          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+          { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+        ];
+        arr.__proto__ = PluginArray.prototype;
+        return arr;
+      }
+    });
+  } catch (e) {}
+
+  try {
+    // 4) window.chrome — must exist. Detectors do "typeof window.chrome === 'object'".
+    if (!window.chrome) {
+      Object.defineProperty(window, 'chrome', {
+        value: {
+          runtime: {},
+          loadTimes: function() { return {}; },
+          csi: function() { return {}; },
+          app: { isInstalled: false }
+        },
+        configurable: true, writable: true
+      });
+    } else if (!window.chrome.runtime) {
+      window.chrome.runtime = {};
+    }
+  } catch (e) {}
+
+  try {
+    // 5) Notification.permission — headless returns 'denied'. Real Chrome returns 'default'.
+    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (originalQuery) {
+      window.navigator.permissions.query = (parameters) =>
+        parameters && parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission === 'default' ? 'prompt' : Notification.permission })
+          : originalQuery(parameters);
+    }
+  } catch (e) {}
+
+  try {
+    // 6) WebGL vendor/renderer — headless returns "Google Inc." / "SwiftShader"
+    // or empty strings. Real Chrome returns hardware info.
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+      if (parameter === 37445) return 'Intel Inc.';
+      if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+      return getParameter.apply(this, arguments);
+    };
+  } catch (e) {}
+
+  try {
+    // 7) navigator.hardwareConcurrency — headless often returns 1.
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+  } catch (e) {}
+
+  try {
+    // 8) navigator.deviceMemory
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+  } catch (e) {}
+
+  try {
+    // 9) Remove the CDP indicator that some detectors read.
+    delete Object.getPrototypeOf(navigator).webdriver;
+  } catch (e) {}
+})();
+`;
 
 export class AccessibilityScanner {
   private scan: any;
@@ -81,7 +205,25 @@ export class AccessibilityScanner {
 
     const browser = await chromium.launch({
       headless: false,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+      executablePath: resolveFullChromiumPath(),
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        // Anti-automation fingerprinting
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=IsolateOrigins,site-per-process,BlockInsecurePrivateNetworkRequests",
+        "--enable-features=NetworkService,NetworkServiceInProcess",
+        // Look like a normal user profile
+        "--disable-infobars",
+        "--no-default-browser-check",
+        "--no-first-run",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        "--window-size=1366,768",
+      ],
+      ignoreDefaultArgs: ["--enable-automation"],
     });
 
     try {
@@ -232,8 +374,27 @@ export class AccessibilityScanner {
     const context = await browser.newContext({
       viewport: { width: opts.viewport_width || 1366, height: opts.viewport_height || 768 },
       ignoreHTTPSErrors: true,
-      locale: "en-US",
+      locale: "it-IT",
+      timezoneId: "Europe/Rome",
+      // A real, current Chrome UA on Linux. NOT "HeadlessChrome".
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+      // Real Chrome ships these headers; headless-shell often omits them.
+      extraHTTPHeaders: {
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Sec-Ch-Ua": "\"Chromium\";v=\"128\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"128\"",
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": "\"Linux\""
+      },
+      deviceScaleFactor: 1,
+      hasTouch: false,
+      isMobile: false,
+      javaScriptEnabled: true,
+      colorScheme: "light",
+      reducedMotion: "no-preference"
     });
+
+    // Apply the stealth patches to every new page in this context.
+    await context.addInitScript({ content: STEALTH_INIT_SCRIPT });
 
     const extensionCookies = Array.isArray(opts.extension_session_cookies) ? opts.extension_session_cookies : [];
     if (extensionCookies.length) {
