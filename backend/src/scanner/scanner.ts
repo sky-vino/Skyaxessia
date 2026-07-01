@@ -15,7 +15,20 @@
  *  ownership.ts       — component/owner attribution
  */
 
-import { chromium } from "playwright";
+// We use playwright-extra + puppeteer-extra-plugin-stealth instead of vanilla
+// playwright.chromium because Sky iD (and other Cloudflare/Akamai-fronted
+// login flows) do binary + protocol-level bot fingerprinting that pure
+// addInitScript patches cannot fully cover. The stealth plugin layers ~20
+// well-maintained anti-detection patches (CDP domain evasion, iframe
+// content window, user agent metadata, WebGL vendor, chrome.runtime,
+// permissions API, hairline, media codecs, source URL evasion, etc.).
+import { chromium as playwrightChromium } from "playwright-extra";
+// puppeteer-extra-plugin-stealth is CJS-only; import via require to avoid
+// TS ESM interop issues.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+playwrightChromium.use(StealthPlugin());
+const chromium = playwrightChromium;
 import * as fs from "fs";
 import * as path from "path";
 import type { ScanOptions, ProgressCallback, ScanIssue, DomSnapshot, TestCase, StateConfig, TargetInteractionConfig, TargetJourneyStep, ControlledInteractionReportItem } from "./types";
