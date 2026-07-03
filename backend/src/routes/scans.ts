@@ -5,6 +5,8 @@ import { scanQueue } from "../services/scanQueue";
 import { generateScanReport } from "../services/reportService";
 import { z } from "zod";
 import { chromium } from "playwright";
+import * as fs from "fs";
+import * as path from "path";
 
 export const scanRouter = Router();
 scanRouter.use(authenticate);
@@ -261,10 +263,79 @@ scanRouter.post("/:id/rerun", async (req: AuthRequest, res: Response): Promise<v
 // GET /api/scans/:id/dom-snapshots
 scanRouter.get("/:id/dom-snapshots", async (req: AuthRequest, res: Response): Promise<void> => {
   const result = await db.query(
-    "SELECT id, scan_id, url, phase, a11y_tree, screenshot, created_at FROM dom_snapshots WHERE scan_id = $1 ORDER BY created_at",
+    "SELECT id, scan_id, url, phase, a11y_tree, screenshot, screen_reader_report, created_at FROM dom_snapshots WHERE scan_id = $1 ORDER BY created_at",
     [req.params.id]
   );
   res.json({ snapshots: result.rows });
+});
+
+// -----------------------------------------------------------------------------
+// GET /api/scans/:id/auth-traces
+// Lists all Playwright trace files captured for this scan (Accedi + Conferma
+// clicks). Response includes a download URL for each file.
+// -----------------------------------------------------------------------------
+scanRouter.get("/:id/auth-traces", async (req: AuthRequest, res: Response): Promise<void> => {
+  const traceDir = process.env.TRACE_DIR || "/home/data/traces";
+  try {
+    const entries = await fs.promises.readdir(traceDir).catch(() => []);
+    const matches = entries
+      .filter(f => f.startsWith(`scan-${req.params.id}-`) && f.endsWith(".zip"))
+      .map(async f => {
+        const st = await fs.promises.stat(path.join(traceDir, f)).catch(() => null);
+        const label = f.replace(`scan-${req.params.id}-`, "").replace(/-\d+\.zip$/, "");
+        return {
+          filename: f,
+          label,
+          size_bytes: st?.size ?? 0,
+          created_at: st ? new Date(st.mtimeMs).toISOString() : null,
+          download_url: `/api/scans/${req.params.id}/auth-trace?filename=${encodeURIComponent(f)}`
+        };
+      });
+    const items = await Promise.all(matches);
+    items.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+    res.json({ traces: items });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Could not list traces" });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// GET /api/scans/:id/auth-trace?filename=xxx.zip
+//   or /api/scans/:id/auth-trace?label=accedi
+// Streams a Playwright trace .zip file back to the caller. The scan owner
+// (Sky team, in our case) opens it in the Playwright trace viewer for a
+// full replay of the auth-click window: screenshots + DOM snapshots + network.
+// -----------------------------------------------------------------------------
+scanRouter.get("/:id/auth-trace", async (req: AuthRequest, res: Response): Promise<void> => {
+  const traceDir = process.env.TRACE_DIR || "/home/data/traces";
+  const requestedFilename = req.query.filename ? String(req.query.filename) : "";
+  const requestedLabel = req.query.label ? String(req.query.label) : "";
+  try {
+    const entries = await fs.promises.readdir(traceDir).catch(() => []);
+    const scanPrefix = `scan-${req.params.id}-`;
+    let matches = entries.filter(f => f.startsWith(scanPrefix) && f.endsWith(".zip"));
+    if (requestedFilename) {
+      // Prevent path traversal — only exact-basename matches allowed.
+      const safe = path.basename(requestedFilename);
+      matches = matches.filter(f => f === safe);
+    } else if (requestedLabel) {
+      matches = matches.filter(f => f.startsWith(`${scanPrefix}${requestedLabel}-`));
+    }
+    if (!matches.length) {
+      res.status(404).json({ error: "No matching trace file found for this scan." });
+      return;
+    }
+    matches.sort().reverse(); // newest first
+    const filePath = path.join(traceDir, matches[0]);
+    res.download(filePath, matches[0], err => {
+      if (err) {
+        // Response may already be sent; log-only.
+        console.warn(`Trace download error for ${filePath}:`, err);
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Could not download trace" });
+  }
 });
 
 // GET /api/scans/:id/test-cases

@@ -15,20 +15,7 @@
  *  ownership.ts       — component/owner attribution
  */
 
-// We use playwright-extra + puppeteer-extra-plugin-stealth instead of vanilla
-// playwright.chromium because Sky iD (and other Cloudflare/Akamai-fronted
-// login flows) do binary + protocol-level bot fingerprinting that pure
-// addInitScript patches cannot fully cover. The stealth plugin layers ~20
-// well-maintained anti-detection patches (CDP domain evasion, iframe
-// content window, user agent metadata, WebGL vendor, chrome.runtime,
-// permissions API, hairline, media codecs, source URL evasion, etc.).
-import { chromium as playwrightChromium } from "playwright-extra";
-// puppeteer-extra-plugin-stealth is CJS-only; import via require to avoid
-// TS ESM interop issues.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const StealthPlugin = require("puppeteer-extra-plugin-stealth");
-playwrightChromium.use(StealthPlugin());
-const chromium = playwrightChromium;
+import { chromium } from "playwright";
 import * as fs from "fs";
 import * as path from "path";
 import type { ScanOptions, ProgressCallback, ScanIssue, DomSnapshot, TestCase, StateConfig, TargetInteractionConfig, TargetJourneyStep, ControlledInteractionReportItem } from "./types";
@@ -41,6 +28,8 @@ import { runColorChecks } from "./colorContrast";
 import { runZoomChecks, runPointerChecks } from "./zoomPointer";
 import { runStateScanning } from "./stateScanner";
 import { enrichOwnership } from "./ownership";
+import { runScreenReader } from "./screenReader";
+import { AuthDiagnostics } from "./authDiagnostics";
 import { logger } from "../utils/logger";
 import { canonicalUrlKey, discoverOutboundLinks, normalizeHttpUrl, passesCrawlFilters, planCrawlUrls } from "./crawlDiscovery";
 
@@ -216,28 +205,60 @@ export class AccessibilityScanner {
       this.onProgress(Math.min(Math.round((stepsDone / totalSteps) * 94) + 1, 94), msg);
     };
 
-    const browser = await chromium.launch({
-      headless: false,
-      executablePath: resolveFullChromiumPath(),
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        // Anti-automation fingerprinting
-        "--disable-blink-features=AutomationControlled",
-        "--disable-features=IsolateOrigins,site-per-process,BlockInsecurePrivateNetworkRequests",
-        "--enable-features=NetworkService,NetworkServiceInProcess",
-        // Look like a normal user profile
-        "--disable-infobars",
-        "--no-default-browser-check",
-        "--no-first-run",
-        "--password-store=basic",
-        "--use-mock-keychain",
-        "--window-size=1366,768",
-      ],
-      ignoreDefaultArgs: ["--enable-automation"],
-    });
+    // ------------------------------------------------------------------------
+    // Diagnostic block: everything up to here is fast. If a scan appears to
+    // "hang" in the Azure log, it's almost always inside chromium.launch().
+    // We log before and after so silent hangs become visible in the stream,
+    // and enforce a 90s timeout so a truly hung launch throws instead of
+    // holding the scan queue slot forever.
+    // ------------------------------------------------------------------------
+    const chromePath = resolveFullChromiumPath();
+    logger.info(`[scan] Launching Chromium...`);
+    logger.info(`[scan]   executablePath=${chromePath || "<playwright default>"}`);
+    logger.info(`[scan]   DISPLAY=${process.env.DISPLAY || "<unset>"}`);
+    logger.info(`[scan]   PLAYWRIGHT_BROWSERS_PATH=${process.env.PLAYWRIGHT_BROWSERS_PATH || "<unset>"}`);
+    logger.info(`[scan]   auth_config=${authConfig ? "present" : "absent"}`);
+
+    const launchStarted = Date.now();
+    const launchTimeoutMs = 90000;
+    let browser: any;
+    try {
+      browser = await Promise.race([
+        chromium.launch({
+          headless: false,
+          executablePath: chromePath,
+          timeout: launchTimeoutMs,
+          args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            // Anti-automation fingerprinting
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process,BlockInsecurePrivateNetworkRequests",
+            "--enable-features=NetworkService,NetworkServiceInProcess",
+            // Look like a normal user profile
+            "--disable-infobars",
+            "--no-default-browser-check",
+            "--no-first-run",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            "--window-size=1366,768",
+          ],
+          ignoreDefaultArgs: ["--enable-automation"],
+        }),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`chromium.launch() exceeded ${launchTimeoutMs}ms timeout`)),
+            launchTimeoutMs + 5000
+          )
+        )
+      ]);
+      logger.info(`[scan] Chromium launched in ${Date.now() - launchStarted}ms`);
+    } catch (err: any) {
+      logger.error(`[scan] chromium.launch FAILED after ${Date.now() - launchStarted}ms: ${err?.message || err}`);
+      throw err;
+    }
 
     try {
       for (const url of urls) {
@@ -489,9 +510,22 @@ export class AccessibilityScanner {
       if (!readyToSubmit) {
         throw new Error("Refusing to click Accedi because username/password are not both verified immediately before submit.");
       }
+
+      // ------------------------------------------------------------------------
+      // Deep diagnostic capture around the Accedi click. Adds five evidence
+      // streams for Sky's ops team: [NET-DIAG], [CONSOLE-DIAG], [COOKIE-DIAG],
+      // [PAGE-DIAG], [TRACE-DIAG]. See authDiagnostics.ts for scope.
+      // ------------------------------------------------------------------------
+      const accediDiag = new AuthDiagnostics(page, this.scan.id || "unknown", "accedi");
+      await accediDiag.startCapture();
+
       const submittedPassword = await this.tryClickFirst(page, submitSelector);
       if (!submittedPassword) await page.keyboard.press("Enter").catch(() => undefined);
       await this.waitForLoginTransition(page, auth, loginUrl, 20000);
+
+      try { await accediDiag.stopAndLog(); }
+      catch (diagErr: any) { logger.warn(`[AUTH-DIAG] Accedi stopAndLog failed: ${diagErr?.message || diagErr}`); }
+
       if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
 
       const otpSelector = this.authSelector(auth, "otp_selector");
@@ -509,6 +543,11 @@ export class AccessibilityScanner {
           if (!otpVerified) throw new Error("OTP fields did not retain all expected digits.");
           this.onProgress(18, "SUCCESS: OTP entered");
           if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
+
+          // Deep diagnostic capture around the Conferma click.
+          const confermaDiag = new AuthDiagnostics(page, this.scan.id || "unknown", "conferma");
+          await confermaDiag.startCapture();
+
           if (otpSubmitSelector) await this.clickFirst(page, otpSubmitSelector);
           else {
             const submittedOtp = await this.tryClickFirst(page, submitSelector);
@@ -516,6 +555,9 @@ export class AccessibilityScanner {
           }
           this.onProgress(20, "SUCCESS: Conferma clicked");
           await this.waitForLoginTransition(page, auth, loginUrl, 20000);
+
+          try { await confermaDiag.stopAndLog(); }
+          catch (diagErr: any) { logger.warn(`[AUTH-DIAG] Conferma stopAndLog failed: ${diagErr?.message || diagErr}`); }
         } catch (otpErr) {
           throw new Error(`OTP field was configured but could not be completed: ${(otpErr as Error)?.message || otpErr}`);
         }
@@ -1944,6 +1986,16 @@ export class AccessibilityScanner {
       this.allIssues.push(...await runAxe(page, targetUrl, this.scan.state_label, "initial"));
     }
 
+    // Screen reader perspective — extracts Chromium AX tree via CDP and derives
+    // announcement transcript, landmarks, headings, live regions, and issues.
+    let screenReaderReport: any = null;
+    if (opts.run_screen_reader !== false) {
+      progress(`Running screen reader perspective analysis on ${targetUrl}`);
+      const srResult = await runScreenReader(page, targetUrl, this.scan.state_label, "initial", true);
+      this.allIssues.push(...srResult.issues);
+      screenReaderReport = srResult.report;
+    }
+
     if (opts.run_heuristics !== false) {
       progress(`Running heuristic checks on ${targetUrl}`);
       this.allIssues.push(...await runHeuristics(page, targetUrl, this.scan.state_label, "initial"));
@@ -2004,6 +2056,9 @@ export class AccessibilityScanner {
       progress(`Capturing accessibility tree for ${targetUrl}`);
       const snapshot = await this.captureSnapshot(page, targetUrl, "initial", opts.capture_screenshots !== false);
       snapshot.a11yTree = this.withStateMatrixMetadata(snapshot.a11yTree, targetUrl, "initial", opts);
+      if (screenReaderReport) {
+        snapshot.screen_reader_report = screenReaderReport;
+      }
       this.domSnapshots.push(snapshot);
       this.recordTransitionNode(targetUrl, "initial", "initial", snapshot.screenshot);
     }
