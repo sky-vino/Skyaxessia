@@ -24,19 +24,11 @@ jobs:
       - name: Print build context
         run: |
           echo "Building commit: ${{ github.sha }}"
-          echo "Branch: ${{ github.ref_name }}"
           node -v
           npm -v
 
-      - name: Clean previous build outputs
-        run: |
-          rm -rf backend/dist
-          rm -rf frontend/dist
-          rm -rf backend/node_modules
-          rm -rf frontend/node_modules
-
       # -----------------------------------------------------------------------
-      # Backend build (TypeScript compile) with full deps present.
+      # Build backend
       # -----------------------------------------------------------------------
       - name: Install backend dependencies
         working-directory: backend
@@ -52,13 +44,13 @@ jobs:
         working-directory: backend
         run: npm run build
 
-      - name: Verify backend compiled output
+      - name: Verify backend build
         run: |
-          test -f backend/dist/index.js || (echo "ERROR: backend/dist/index.js missing" && exit 1)
-          ls -la backend/dist/ | head
+          test -f backend/dist/index.js || (echo "ERROR: backend/dist/index.js MISSING" && exit 1)
+          echo "OK: backend/dist/index.js present ($(wc -c < backend/dist/index.js) bytes)"
 
       # -----------------------------------------------------------------------
-      # Frontend build (Vite).
+      # Build frontend
       # -----------------------------------------------------------------------
       - name: Install frontend dependencies
         working-directory: frontend
@@ -68,47 +60,81 @@ jobs:
         working-directory: frontend
         run: npm run build
 
-      - name: Verify frontend compiled output
+      - name: Verify frontend build
         run: |
-          test -f frontend/dist/index.html || (echo "ERROR: frontend/dist/index.html missing" && exit 1)
-          ls -la frontend/dist/
+          test -f frontend/dist/index.html || (echo "ERROR: frontend/dist/index.html MISSING" && exit 1)
+          echo "OK: frontend/dist/index.html present ($(wc -c < frontend/dist/index.html) bytes)"
+          ls -la frontend/dist/assets/ | head
 
       # -----------------------------------------------------------------------
-      # Reinstall backend with production-only deps before packaging,
-      # and rebuild sqlite3 native binary against the Node ABI used at runtime.
+      # Prune backend to production deps (smaller artifact, faster Azure start)
       # -----------------------------------------------------------------------
-      - name: Prune backend to production deps + rebuild sqlite3
+      - name: Prune backend to production deps
         working-directory: backend
-        env:
-          npm_config_build_from_source: "sqlite3"
         run: |
           rm -rf node_modules
           npm install --omit=dev --no-audit --no-fund
-          npm rebuild sqlite3 --build-from-source || echo "(sqlite3 rebuild skipped)"
 
-      - name: Stamp deployment with commit SHA
+      # -----------------------------------------------------------------------
+      # Stamp the commit into the deploy so we can verify what's running
+      # -----------------------------------------------------------------------
+      - name: Stamp deployment
         run: |
           echo "commit=${{ github.sha }}" > .deploy-sha
           echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .deploy-sha
-          echo "branch=${{ github.ref_name }}" >> .deploy-sha
           cat .deploy-sha
 
       # -----------------------------------------------------------------------
-      # Upload only what App Service needs at runtime.
+      # CRITICAL FIX: zip the deploy locally so upload-artifact preserves
+      # nested directories (backend/dist AND backend/package.json etc).
+      # The previous multi-path upload was producing empty subdirectories on
+      # download because of how upload-artifact@v4 merges parent paths.
       # -----------------------------------------------------------------------
+      - name: Assemble deploy package
+        run: |
+          mkdir -p deploy
+          cp -r backend/dist deploy/backend-dist
+          cp -r backend/node_modules deploy/backend-node_modules
+          cp backend/package.json deploy/backend-package.json
+          cp -r frontend/dist deploy/frontend-dist
+          cp -r playwright-browsers deploy/playwright-browsers
+          cp startup.sh deploy/startup.sh
+          cp .deploy-sha deploy/.deploy-sha
+
+          # Reassemble into wwwroot layout
+          mkdir -p out/backend out/frontend
+          mv deploy/backend-dist out/backend/dist
+          mv deploy/backend-node_modules out/backend/node_modules
+          mv deploy/backend-package.json out/backend/package.json
+          mv deploy/frontend-dist out/frontend/dist
+          mv deploy/playwright-browsers out/playwright-browsers
+          mv deploy/startup.sh out/startup.sh
+          mv deploy/.deploy-sha out/.deploy-sha
+
+          echo "=== Verify final deploy tree ==="
+          ls -la out/
+          echo ""
+          echo "backend/dist:"
+          ls out/backend/dist/ | head -5
+          echo ""
+          echo "frontend/dist:"
+          ls out/frontend/dist/ | head -5
+          echo ""
+          echo "playwright-browsers:"
+          ls out/playwright-browsers/ | head -5
+          echo ""
+          echo "=== Zipping ==="
+          cd out
+          zip -rq ../deploy.zip .
+          cd ..
+          ls -lh deploy.zip
+
       - name: Upload deployment artifact
         uses: actions/upload-artifact@v4
         with:
           name: node-app
           retention-days: 7
-          path: |
-            backend/dist
-            backend/node_modules
-            backend/package.json
-            frontend/dist
-            playwright-browsers
-            startup.sh
-            .deploy-sha
+          path: deploy.zip
 
   deploy:
     runs-on: ubuntu-latest
@@ -123,25 +149,12 @@ jobs:
         with:
           name: node-app
 
-      - name: Inspect artifact contents
+      - name: Verify downloaded artifact
         run: |
-          echo "Deploying commit:"
-          cat .deploy-sha || echo "(deploy stamp missing)"
+          ls -lh
           echo ""
-          echo "Top-level:"
-          ls -la
-          echo ""
-          echo "backend/dist:"
-          ls -la backend/dist/ | head -10 || echo "(missing)"
-          echo ""
-          echo "frontend/dist:"
-          ls -la frontend/dist/ | head -10 || echo "(missing)"
-          echo ""
-          echo "playwright-browsers:"
-          ls -la playwright-browsers/ | head -5 || echo "(missing)"
-          echo ""
-          echo "startup.sh:"
-          ls -la startup.sh || echo "(MISSING — Azure Startup Command will fail!)"
+          echo "=== Zip contents (first 20 entries) ==="
+          unzip -l deploy.zip | head -25
 
       - name: Login to Azure
         uses: azure/login@v2
@@ -150,11 +163,14 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_A8B585A68A244EC4BF7D854E7A5F7D9F }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_1CEE1CEF9E51416AA51AC8B93BD622B4 }}
 
+      # -----------------------------------------------------------------------
+      # Deploy the zip DIRECTLY. Azure will extract it into /home/site/wwwroot.
+      # This is the proven reliable pattern.
+      # -----------------------------------------------------------------------
       - name: Deploy to Azure Web App
-        id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'axessia-app'
           slot-name: 'Production'
           clean: true
-          package: .
+          package: deploy.zip
