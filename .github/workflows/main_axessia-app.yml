@@ -85,10 +85,7 @@ jobs:
           cat .deploy-sha
 
       # -----------------------------------------------------------------------
-      # CRITICAL FIX: zip the deploy locally so upload-artifact preserves
-      # nested directories (backend/dist AND backend/package.json etc).
-      # The previous multi-path upload was producing empty subdirectories on
-      # download because of how upload-artifact@v4 merges parent paths.
+      # Assemble deploy package
       # -----------------------------------------------------------------------
       - name: Assemble deploy package
         run: |
@@ -110,6 +107,21 @@ jobs:
           mv deploy/playwright-browsers out/playwright-browsers
           mv deploy/startup.sh out/startup.sh
           mv deploy/.deploy-sha out/.deploy-sha
+
+          # -------------------------------------------------------------------
+          # CRITICAL: Strip the sqlite3 pre-built native binary (.node file).
+          # The GitHub runner (Ubuntu) and Azure App Service use different glibc
+          # versions, so the binary compiled here fails to load on Azure and
+          # forces a ~90s source rebuild on EVERY cold start, pushing total
+          # startup past Azure's 230s timeout.
+          # startup.sh rebuilds sqlite3 once on first boot and caches the
+          # result under /home (persistent) keyed to the deploy SHA, so all
+          # subsequent restarts use the cache and start in ~30s.
+          # -------------------------------------------------------------------
+          echo "==> Stripping sqlite3 pre-built native binary"
+          find out/backend/node_modules/sqlite3/build -name "*.node" -delete 2>/dev/null || true
+          rm -rf out/backend/node_modules/sqlite3/build/Release 2>/dev/null || true
+          echo "==> sqlite3 build artifacts removed — Azure will rebuild and cache on first boot"
 
           echo "=== Verify final deploy tree ==="
           ls -la out/
@@ -163,10 +175,6 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_A8B585A68A244EC4BF7D854E7A5F7D9F }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_1CEE1CEF9E51416AA51AC8B93BD622B4 }}
 
-      # -----------------------------------------------------------------------
-      # Deploy the zip DIRECTLY. Azure will extract it into /home/site/wwwroot.
-      # This is the proven reliable pattern.
-      # -----------------------------------------------------------------------
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
