@@ -42,7 +42,7 @@ jobs:
 
       - name: Compile backend TypeScript
         working-directory: backend
-        run: npm run build
+        run: node node_modules/typescript/bin/tsc
 
       - name: Verify backend build
         run: |
@@ -58,7 +58,7 @@ jobs:
 
       - name: Build frontend
         working-directory: frontend
-        run: npm run build
+        run: node node_modules/vite/bin/vite.js build
 
       - name: Verify frontend build
         run: |
