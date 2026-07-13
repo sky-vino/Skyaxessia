@@ -9,38 +9,106 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    permissions:
+      contents: read
 
-      - name: Set up Node.js
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22.x'
 
-      - name: Install and build backend
-        working-directory: ./backend
+      - name: Print build context
         run: |
-          npm ci
-          npm run build
+          echo "Building commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          node -v
+          npm -v
 
-      - name: Install and build frontend
-        working-directory: ./frontend
+      - name: Clean previous build outputs
         run: |
-          npm ci
-          npm run build
-
-      - name: Prepare deploy package
-        run: |
-          # Trim things Azure doesn't need at runtime to speed up deploy.
+          rm -rf backend/dist
+          rm -rf frontend/dist
           rm -rf backend/node_modules
           rm -rf frontend/node_modules
-          rm -rf frontend/src
 
-      - name: Upload artifact for deployment
+      # -----------------------------------------------------------------------
+      # Backend build (TypeScript compile) with full deps present.
+      # -----------------------------------------------------------------------
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install --no-audit --no-fund
+
+      - name: Install Playwright Chromium
+        working-directory: backend
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-browsers
+        run: npx playwright install chromium
+
+      - name: Compile backend TypeScript
+        working-directory: backend
+        run: npm run build
+
+      - name: Verify backend compiled output
+        run: |
+          test -f backend/dist/index.js || (echo "ERROR: backend/dist/index.js missing" && exit 1)
+          ls -la backend/dist/ | head
+
+      # -----------------------------------------------------------------------
+      # Frontend build (Vite).
+      # -----------------------------------------------------------------------
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install --no-audit --no-fund
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Verify frontend compiled output
+        run: |
+          test -f frontend/dist/index.html || (echo "ERROR: frontend/dist/index.html missing" && exit 1)
+          ls -la frontend/dist/
+
+      # -----------------------------------------------------------------------
+      # Reinstall backend with production-only deps before packaging,
+      # and rebuild sqlite3 native binary against the Node ABI used at runtime.
+      # -----------------------------------------------------------------------
+      - name: Prune backend to production deps + rebuild sqlite3
+        working-directory: backend
+        env:
+          npm_config_build_from_source: "sqlite3"
+        run: |
+          rm -rf node_modules
+          npm install --omit=dev --no-audit --no-fund
+          npm rebuild sqlite3 --build-from-source || echo "(sqlite3 rebuild skipped)"
+
+      - name: Stamp deployment with commit SHA
+        run: |
+          echo "commit=${{ github.sha }}" > .deploy-sha
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .deploy-sha
+          echo "branch=${{ github.ref_name }}" >> .deploy-sha
+          cat .deploy-sha
+
+      # -----------------------------------------------------------------------
+      # Upload only what App Service needs at runtime.
+      # -----------------------------------------------------------------------
+      - name: Upload deployment artifact
         uses: actions/upload-artifact@v4
         with:
           name: node-app
-          path: .
+          retention-days: 7
+          path: |
+            backend/dist
+            backend/node_modules
+            backend/package.json
+            frontend/dist
+            playwright-browsers
+            startup.sh
+            .deploy-sha
 
   deploy:
     runs-on: ubuntu-latest
@@ -48,11 +116,32 @@ jobs:
     permissions:
       id-token: write
       contents: read
+
     steps:
-      - name: Download artifact
+      - name: Download deployment artifact
         uses: actions/download-artifact@v4
         with:
           name: node-app
+
+      - name: Inspect artifact contents
+        run: |
+          echo "Deploying commit:"
+          cat .deploy-sha || echo "(deploy stamp missing)"
+          echo ""
+          echo "Top-level:"
+          ls -la
+          echo ""
+          echo "backend/dist:"
+          ls -la backend/dist/ | head -10 || echo "(missing)"
+          echo ""
+          echo "frontend/dist:"
+          ls -la frontend/dist/ | head -10 || echo "(missing)"
+          echo ""
+          echo "playwright-browsers:"
+          ls -la playwright-browsers/ | head -5 || echo "(missing)"
+          echo ""
+          echo "startup.sh:"
+          ls -la startup.sh || echo "(MISSING — Azure Startup Command will fail!)"
 
       - name: Login to Azure
         uses: azure/login@v2
@@ -62,8 +151,10 @@ jobs:
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_1CEE1CEF9E51416AA51AC8B93BD622B4 }}
 
       - name: Deploy to Azure Web App
+        id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'axessia-app'
           slot-name: 'Production'
+          clean: true
           package: .
