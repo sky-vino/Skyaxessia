@@ -9,30 +9,57 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # ─── CRITICAL ────────────────────────────────────────────────────────────
+    # Build inside Debian 12 (bookworm) + Node 22, which is EXACTLY what
+    # Azure App Service Linux runs (GLIBC 2.36).
+    # The default ubuntu-latest runner is Ubuntu 24.04 (GLIBC 2.39) — any
+    # native .node binary compiled there fails on Azure with:
+    #   "GLIBC_2.38 not found"
+    # Running in this container ensures sqlite3 is compiled for GLIBC 2.36.
+    # ─────────────────────────────────────────────────────────────────────────
+    container:
+      image: node:22-bookworm
+
     permissions:
       contents: read
 
     steps:
+      - name: Install system build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            python3 make g++ git zip curl ca-certificates
+          echo "Node: $(node -v)"
+          echo "npm:  $(npm -v)"
+          echo "GLIBC: $(ldd --version | head -1)"
+
       - name: Checkout source
         uses: actions/checkout@v4
-
-      - name: Set up Node.js 22
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22.x'
 
       - name: Print build context
         run: |
           echo "Building commit: ${{ github.sha }}"
-          node -v
-          npm -v
+          echo "Branch: ${{ github.ref_name }}"
 
       # -----------------------------------------------------------------------
-      # Build backend
+      # Build backend — force sqlite3 to compile from source inside this
+      # container so the .node binary targets GLIBC 2.36 (Azure-safe).
       # -----------------------------------------------------------------------
       - name: Install backend dependencies
         working-directory: backend
-        run: npm install --no-audit --no-fund
+        env:
+          npm_config_build_from_source: "sqlite3"
+        run: |
+          npm install --no-audit --no-fund
+          npm rebuild sqlite3 --build-from-source
+
+      - name: Verify sqlite3 loads
+        working-directory: backend
+        run: |
+          node -e "require('sqlite3'); console.log('OK: sqlite3 loaded')"
+          echo "GLIBC requirements of sqlite3 binary:"
+          find node_modules/sqlite3/build/Release -name "*.node" \
+            -exec ldd {} \; | grep -E "GLIBC|not found" || echo "(clean)"
 
       - name: Install Playwright Chromium
         working-directory: backend
@@ -67,16 +94,21 @@ jobs:
           ls -la frontend/dist/assets/ | head
 
       # -----------------------------------------------------------------------
-      # Prune backend to production deps (smaller artifact, faster Azure start)
+      # Prune backend to production deps only — rebuild sqlite3 again so the
+      # pruned node_modules still has the correct Azure-compatible binary.
       # -----------------------------------------------------------------------
       - name: Prune backend to production deps
         working-directory: backend
+        env:
+          npm_config_build_from_source: "sqlite3"
         run: |
           rm -rf node_modules
           npm install --omit=dev --no-audit --no-fund
+          npm rebuild sqlite3 --build-from-source
+          node -e "require('sqlite3'); console.log('OK: sqlite3 still loads after prune')"
 
       # -----------------------------------------------------------------------
-      # Stamp the commit into the deploy so we can verify what's running
+      # Stamp the commit
       # -----------------------------------------------------------------------
       - name: Stamp deployment
         run: |
@@ -85,7 +117,7 @@ jobs:
           cat .deploy-sha
 
       # -----------------------------------------------------------------------
-      # Assemble deploy package
+      # Assemble and zip deploy package
       # -----------------------------------------------------------------------
       - name: Assemble deploy package
         run: |
@@ -98,7 +130,6 @@ jobs:
           cp startup.sh deploy/startup.sh
           cp .deploy-sha deploy/.deploy-sha
 
-          # Reassemble into wwwroot layout
           mkdir -p out/backend out/frontend
           mv deploy/backend-dist out/backend/dist
           mv deploy/backend-node_modules out/backend/node_modules
@@ -108,37 +139,14 @@ jobs:
           mv deploy/startup.sh out/startup.sh
           mv deploy/.deploy-sha out/.deploy-sha
 
-          # -------------------------------------------------------------------
-          # CRITICAL: Strip the sqlite3 pre-built native binary (.node file).
-          # The GitHub runner (Ubuntu) and Azure App Service use different glibc
-          # versions, so the binary compiled here fails to load on Azure and
-          # forces a ~90s source rebuild on EVERY cold start, pushing total
-          # startup past Azure's 230s timeout.
-          # startup.sh rebuilds sqlite3 once on first boot and caches the
-          # result under /home (persistent) keyed to the deploy SHA, so all
-          # subsequent restarts use the cache and start in ~30s.
-          # -------------------------------------------------------------------
-          echo "==> Stripping sqlite3 pre-built native binary"
-          find out/backend/node_modules/sqlite3/build -name "*.node" -delete 2>/dev/null || true
-          rm -rf out/backend/node_modules/sqlite3/build/Release 2>/dev/null || true
-          echo "==> sqlite3 build artifacts removed — Azure will rebuild and cache on first boot"
-
           echo "=== Verify final deploy tree ==="
           ls -la out/
-          echo ""
-          echo "backend/dist:"
-          ls out/backend/dist/ | head -5
-          echo ""
-          echo "frontend/dist:"
-          ls out/frontend/dist/ | head -5
-          echo ""
-          echo "playwright-browsers:"
-          ls out/playwright-browsers/ | head -5
+          echo "backend/dist:"; ls out/backend/dist/ | head -5
+          echo "frontend/dist:"; ls out/frontend/dist/ | head -5
+          echo "playwright-browsers:"; ls out/playwright-browsers/ | head -5
           echo ""
           echo "=== Zipping ==="
-          cd out
-          zip -rq ../deploy.zip .
-          cd ..
+          cd out && zip -rq ../deploy.zip . && cd ..
           ls -lh deploy.zip
 
       - name: Upload deployment artifact
@@ -164,7 +172,6 @@ jobs:
       - name: Verify downloaded artifact
         run: |
           ls -lh
-          echo ""
           echo "=== Zip contents (first 20 entries) ==="
           unzip -l deploy.zip | head -25
 
