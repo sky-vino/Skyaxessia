@@ -16,8 +16,6 @@
  */
 
 import { chromium } from "playwright";
-import * as fs from "fs";
-import * as path from "path";
 import type { ScanOptions, ProgressCallback, ScanIssue, DomSnapshot, TestCase, StateConfig, TargetInteractionConfig, TargetJourneyStep, ControlledInteractionReportItem } from "./types";
 import { navigateSafely } from "./navigation";
 import { runAxe } from "./axeScan";
@@ -28,8 +26,6 @@ import { runColorChecks } from "./colorContrast";
 import { runZoomChecks, runPointerChecks } from "./zoomPointer";
 import { runStateScanning } from "./stateScanner";
 import { enrichOwnership } from "./ownership";
-import { runScreenReader } from "./screenReader";
-import { AuthDiagnostics } from "./authDiagnostics";
 import { logger } from "../utils/logger";
 import { canonicalUrlKey, discoverOutboundLinks, normalizeHttpUrl, passesCrawlFilters, planCrawlUrls } from "./crawlDiscovery";
 
@@ -40,128 +36,6 @@ export interface ScanResult {
   navigatedUrls: string[];
   score: number;
 }
-
-// -----------------------------------------------------------------------------
-// Anti-detection helpers
-// -----------------------------------------------------------------------------
-// Bot detectors (Sky iD, Cloudflare Turnstile, Akamai Bot Manager, etc.) look
-// for the `chrome-headless-shell` binary specifically. Playwright 1.49+
-// defaults to that binary for `headless: true`. To evade the check we:
-//   1. Point executablePath at the *full* Chromium binary the workflow ships.
-//   2. Launch with `headless: false` and rely on Xvfb providing $DISPLAY.
-//   3. Inject a stealth script that patches the JS-visible signals detectors
-//      test (webdriver, chrome.runtime, WebGL vendor, permissions, plugins).
-
-function resolveFullChromiumPath(): string | undefined {
-  // If PLAYWRIGHT_BROWSERS_PATH is set (Azure: /home/playwright-browsers),
-  // search for chromium-<rev>/chrome-linux64/chrome. Fall back to Playwright
-  // default (returns undefined here so Playwright picks its own).
-  const browsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
-  if (!browsersPath) return undefined;
-  try {
-    if (!fs.existsSync(browsersPath)) return undefined;
-    const entries = fs.readdirSync(browsersPath);
-    // Prefer full chromium (not chromium_headless_shell) which starts with
-    // exactly "chromium-" followed by a revision number.
-    const chromiumDir = entries.find(name =>
-      /^chromium-\d+$/.test(name)
-    );
-    if (!chromiumDir) return undefined;
-    const candidate = path.join(browsersPath, chromiumDir, "chrome-linux64", "chrome");
-    if (fs.existsSync(candidate)) {
-      logger.info(`Scanner using full Chromium binary: ${candidate}`);
-      return candidate;
-    }
-  } catch (err) {
-    logger.warn("resolveFullChromiumPath failed; falling back to Playwright default:", err);
-  }
-  return undefined;
-}
-
-// This script is evaluated in every new document before any page script.
-// Patches the fingerprint tells that bot detectors check.
-const STEALTH_INIT_SCRIPT = `
-(() => {
-  try {
-    // 1) navigator.webdriver — the single biggest tell.
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  } catch (e) {}
-
-  try {
-    // 2) navigator.languages — headless returns [] by default.
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-  } catch (e) {}
-
-  try {
-    // 3) navigator.plugins — headless has 0. Real Chrome has PDF viewer + others.
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => {
-        const arr = [
-          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-          { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-        ];
-        arr.__proto__ = PluginArray.prototype;
-        return arr;
-      }
-    });
-  } catch (e) {}
-
-  try {
-    // 4) window.chrome — must exist. Detectors do "typeof window.chrome === 'object'".
-    if (!window.chrome) {
-      Object.defineProperty(window, 'chrome', {
-        value: {
-          runtime: {},
-          loadTimes: function() { return {}; },
-          csi: function() { return {}; },
-          app: { isInstalled: false }
-        },
-        configurable: true, writable: true
-      });
-    } else if (!window.chrome.runtime) {
-      window.chrome.runtime = {};
-    }
-  } catch (e) {}
-
-  try {
-    // 5) Notification.permission — headless returns 'denied'. Real Chrome returns 'default'.
-    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
-    if (originalQuery) {
-      window.navigator.permissions.query = (parameters) =>
-        parameters && parameters.name === 'notifications'
-          ? Promise.resolve({ state: Notification.permission === 'default' ? 'prompt' : Notification.permission })
-          : originalQuery(parameters);
-    }
-  } catch (e) {}
-
-  try {
-    // 6) WebGL vendor/renderer — headless returns "Google Inc." / "SwiftShader"
-    // or empty strings. Real Chrome returns hardware info.
-    const getParameter = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(parameter) {
-      if (parameter === 37445) return 'Intel Inc.';
-      if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-      return getParameter.apply(this, arguments);
-    };
-  } catch (e) {}
-
-  try {
-    // 7) navigator.hardwareConcurrency — headless often returns 1.
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-  } catch (e) {}
-
-  try {
-    // 8) navigator.deviceMemory
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-  } catch (e) {}
-
-  try {
-    // 9) Remove the CDP indicator that some detectors read.
-    delete Object.getPrototypeOf(navigator).webdriver;
-  } catch (e) {}
-})();
-`;
 
 export class AccessibilityScanner {
   private scan: any;
@@ -205,60 +79,10 @@ export class AccessibilityScanner {
       this.onProgress(Math.min(Math.round((stepsDone / totalSteps) * 94) + 1, 94), msg);
     };
 
-    // ------------------------------------------------------------------------
-    // Diagnostic block: everything up to here is fast. If a scan appears to
-    // "hang" in the Azure log, it's almost always inside chromium.launch().
-    // We log before and after so silent hangs become visible in the stream,
-    // and enforce a 90s timeout so a truly hung launch throws instead of
-    // holding the scan queue slot forever.
-    // ------------------------------------------------------------------------
-    const chromePath = resolveFullChromiumPath();
-    logger.info(`[scan] Launching Chromium...`);
-    logger.info(`[scan]   executablePath=${chromePath || "<playwright default>"}`);
-    logger.info(`[scan]   DISPLAY=${process.env.DISPLAY || "<unset>"}`);
-    logger.info(`[scan]   PLAYWRIGHT_BROWSERS_PATH=${process.env.PLAYWRIGHT_BROWSERS_PATH || "<unset>"}`);
-    logger.info(`[scan]   auth_config=${authConfig ? "present" : "absent"}`);
-
-    const launchStarted = Date.now();
-    const launchTimeoutMs = 90000;
-    let browser: any;
-    try {
-      browser = await Promise.race([
-        chromium.launch({
-          headless: false,
-          executablePath: chromePath,
-          timeout: launchTimeoutMs,
-          args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            // Anti-automation fingerprinting
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process,BlockInsecurePrivateNetworkRequests",
-            "--enable-features=NetworkService,NetworkServiceInProcess",
-            // Look like a normal user profile
-            "--disable-infobars",
-            "--no-default-browser-check",
-            "--no-first-run",
-            "--password-store=basic",
-            "--use-mock-keychain",
-            "--window-size=1366,768",
-          ],
-          ignoreDefaultArgs: ["--enable-automation"],
-        }),
-        new Promise((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`chromium.launch() exceeded ${launchTimeoutMs}ms timeout`)),
-            launchTimeoutMs + 5000
-          )
-        )
-      ]);
-      logger.info(`[scan] Chromium launched in ${Date.now() - launchStarted}ms`);
-    } catch (err: any) {
-      logger.error(`[scan] chromium.launch FAILED after ${Date.now() - launchStarted}ms: ${err?.message || err}`);
-      throw err;
-    }
+    const browser = await chromium.launch({
+      headless: false,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    });
 
     try {
       for (const url of urls) {
@@ -317,7 +141,7 @@ export class AccessibilityScanner {
               const profileUrl = String(authConfig.profile_url || "").trim();
               const profileKey = canonicalUrlKey(profileUrl) || profileUrl;
               const profileAuthKey = `auth:${profileKey}`;
-              if (!journeyOnlyMode && opts.scan_gestisci_page !== false && profileUrl && !scannedEntrypoints.has(profileAuthKey)) {
+              if (!journeyOnlyMode && opts.scan_gestisci_page === true && profileUrl && !scannedEntrypoints.has(profileAuthKey)) {
                 progress(`Opening authenticated profile page: ${profileUrl}`);
                 const ok = await this.navigateAndRecord(page, profileUrl, "Gestisci/profile");
                 if (!ok) throw new Error(`Authenticated profile page is unreachable: ${profileUrl}`);
@@ -396,6 +220,13 @@ export class AccessibilityScanner {
 
     this.addStateGraphSummarySnapshot();
     this.allIssues = this.prioritizeIssues(this.calibrateIssues(this.deduplicateIssues(this.allIssues)));
+    // Ship 2 / Item 5 — assign a landmark_group_key to issues whose selector
+    // clearly targets a landmark region (banner / contentinfo / navigation /
+    // main / complementary / region / search / form). The scan detail
+    // endpoint later collapses issues sharing the same key across pages so
+    // e.g. one contentinfo issue on 30 crawled pages shows as one entry
+    // with a "Appears on 30 pages" chip instead of 30 duplicates.
+    this.assignLandmarkGroupKeys(this.allIssues);
     this.generateTestCases();
     this.generateManualHybridReviewCases();
     const score = this.computeScore(this.allIssues);
@@ -408,27 +239,8 @@ export class AccessibilityScanner {
     const context = await browser.newContext({
       viewport: { width: opts.viewport_width || 1366, height: opts.viewport_height || 768 },
       ignoreHTTPSErrors: true,
-      locale: "it-IT",
-      timezoneId: "Europe/Rome",
-      // A real, current Chrome UA on Linux. NOT "HeadlessChrome".
-      userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-      // Real Chrome ships these headers; headless-shell often omits them.
-      extraHTTPHeaders: {
-        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Sec-Ch-Ua": "\"Chromium\";v=\"128\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"128\"",
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": "\"Linux\""
-      },
-      deviceScaleFactor: 1,
-      hasTouch: false,
-      isMobile: false,
-      javaScriptEnabled: true,
-      colorScheme: "light",
-      reducedMotion: "no-preference"
+      locale: "en-US",
     });
-
-    // Apply the stealth patches to every new page in this context.
-    await context.addInitScript({ content: STEALTH_INIT_SCRIPT });
 
     const extensionCookies = Array.isArray(opts.extension_session_cookies) ? opts.extension_session_cookies : [];
     if (extensionCookies.length) {
@@ -510,22 +322,9 @@ export class AccessibilityScanner {
       if (!readyToSubmit) {
         throw new Error("Refusing to click Accedi because username/password are not both verified immediately before submit.");
       }
-
-      // ------------------------------------------------------------------------
-      // Deep diagnostic capture around the Accedi click. Adds five evidence
-      // streams for Sky's ops team: [NET-DIAG], [CONSOLE-DIAG], [COOKIE-DIAG],
-      // [PAGE-DIAG], [TRACE-DIAG]. See authDiagnostics.ts for scope.
-      // ------------------------------------------------------------------------
-      const accediDiag = new AuthDiagnostics(page, this.scan.id || "unknown", "accedi");
-      await accediDiag.startCapture();
-
       const submittedPassword = await this.tryClickFirst(page, submitSelector);
       if (!submittedPassword) await page.keyboard.press("Enter").catch(() => undefined);
       await this.waitForLoginTransition(page, auth, loginUrl, 20000);
-
-      try { await accediDiag.stopAndLog(); }
-      catch (diagErr: any) { logger.warn(`[AUTH-DIAG] Accedi stopAndLog failed: ${diagErr?.message || diagErr}`); }
-
       if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
 
       const otpSelector = this.authSelector(auth, "otp_selector");
@@ -543,11 +342,6 @@ export class AccessibilityScanner {
           if (!otpVerified) throw new Error("OTP fields did not retain all expected digits.");
           this.onProgress(18, "SUCCESS: OTP entered");
           if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
-
-          // Deep diagnostic capture around the Conferma click.
-          const confermaDiag = new AuthDiagnostics(page, this.scan.id || "unknown", "conferma");
-          await confermaDiag.startCapture();
-
           if (otpSubmitSelector) await this.clickFirst(page, otpSubmitSelector);
           else {
             const submittedOtp = await this.tryClickFirst(page, submitSelector);
@@ -555,9 +349,6 @@ export class AccessibilityScanner {
           }
           this.onProgress(20, "SUCCESS: Conferma clicked");
           await this.waitForLoginTransition(page, auth, loginUrl, 20000);
-
-          try { await confermaDiag.stopAndLog(); }
-          catch (diagErr: any) { logger.warn(`[AUTH-DIAG] Conferma stopAndLog failed: ${diagErr?.message || diagErr}`); }
         } catch (otpErr) {
           throw new Error(`OTP field was configured but could not be completed: ${(otpErr as Error)?.message || otpErr}`);
         }
@@ -1981,19 +1772,51 @@ export class AccessibilityScanner {
     this.scannedPageKeys.add(pageKey);
     await this.prepareFullPageForScan(page, targetUrl, progress);
 
+    // ═══ URL drift check — Tier 3 fix ══════════════════════════════════════
+    // Sky Web Self Care (and similar SPAs) can client-side re-route AFTER the
+    // strict URL check above but DURING prepareFullPageForScan, because the
+    // scroll pass triggers lazy data loading, and Sky's router evaluates
+    // "which section should this user land on?" against that data. The
+    // scanner would then run every subsequent check on the drifted URL
+    // (e.g. /home) while recording all issues under the requested URL
+    // (e.g. /offers) — producing a report that's internally inconsistent:
+    // affected element names belong to one page, the URL column names the
+    // other. This block detects the drift, retries once, and — if the drift
+    // is persistent — updates targetUrl so all subsequent phases record
+    // issues under the URL that was ACTUALLY scanned.
+    {
+      const postPrepUrl = (() => {
+        try { return page.url(); } catch { return targetUrl; }
+      })();
+      if (!this.sameUrlWithoutHash(postPrepUrl, targetUrl)) {
+        logger.warn(`URL drifted from ${targetUrl} to ${postPrepUrl} during page preparation (SPA client-side redirect). Attempting one recovery.`);
+        progress(`WARN: Page drifted to ${postPrepUrl}; attempting to return to ${targetUrl}`);
+        const recovered = await this.navigateAndRecord(page, targetUrl, "recover from client-side drift").catch(() => false);
+        if (recovered) {
+          await this.waitForMeaningfulPageContent(page, targetUrl);
+          await this.prepareFullPageForScan(page, targetUrl, progress);
+        }
+        const finalUrl = (() => {
+          try { return page.url(); } catch { return targetUrl; }
+        })();
+        if (!this.sameUrlWithoutHash(finalUrl, targetUrl)) {
+          logger.warn(`Persistent SPA redirect: requested ${targetUrl}, browser settled on ${finalUrl}. All subsequent issues will be recorded under ${finalUrl} instead of ${targetUrl}.`);
+          progress(`WARN: Persistent SPA redirect. All issues will be recorded under ${finalUrl} instead of the requested ${targetUrl}.`);
+          this.addTargetRedirectEvidence(targetUrl, finalUrl);
+          // Reassign so every check below records under the actual URL.
+          // Note: pageKey de-duplication above already ran with the original
+          // targetUrl; if the drifted URL was previously scanned we accept
+          // the duplicate rather than skip, because we still need coverage
+          // of this authenticated context.
+          targetUrl = finalUrl;
+        }
+      }
+    }
+    // ═══════════════════════════════════════════════════════════════════════
+
     if (opts.run_axe !== false) {
       progress(`Running axe-core WCAG scan on ${targetUrl}`);
       this.allIssues.push(...await runAxe(page, targetUrl, this.scan.state_label, "initial"));
-    }
-
-    // Screen reader perspective — extracts Chromium AX tree via CDP and derives
-    // announcement transcript, landmarks, headings, live regions, and issues.
-    let screenReaderReport: any = null;
-    if (opts.run_screen_reader !== false) {
-      progress(`Running screen reader perspective analysis on ${targetUrl}`);
-      const srResult = await runScreenReader(page, targetUrl, this.scan.state_label, "initial", true);
-      this.allIssues.push(...srResult.issues);
-      screenReaderReport = srResult.report;
     }
 
     if (opts.run_heuristics !== false) {
@@ -2012,8 +1835,11 @@ export class AccessibilityScanner {
     }
 
     if (opts.run_zoom !== false) {
-      progress(`Running zoom and reflow checks on ${targetUrl}`);
-      this.allIssues.push(...await runZoomChecks(page, targetUrl, this.scan.state_label, "zoom"));
+      // Ship 1 / Item 4 — audit target defaults to 200% (this team's scenario).
+      // 400% keeps the WCAG 1.4.10 320px reflow test. See ScanOptions.zoom_target_percent.
+      const zoomTargetPercent: 200 | 400 = opts.zoom_target_percent === 400 ? 400 : 200;
+      progress(`Running zoom and reflow checks on ${targetUrl} (target ${zoomTargetPercent}%)`);
+      this.allIssues.push(...await runZoomChecks(page, targetUrl, this.scan.state_label, "zoom", zoomTargetPercent));
     }
 
     if (opts.run_pointer !== false) {
@@ -2025,6 +1851,30 @@ export class AccessibilityScanner {
       progress(`Simulating keyboard navigation on ${targetUrl}`);
       this.allIssues.push(...await runKeyboardNav(page, targetUrl, this.scan.state_label));
     }
+
+    // ═══ Mid-scan URL drift check ═════════════════════════════════════════
+    // runKeyboardNav presses Enter on custom-role elements (Fix 1) and skip
+    // links. Either can trigger navigation. If it did, the state scanner
+    // below would run on the wrong URL. Navigate back to `targetUrl` once;
+    // if it drifted persistently, do NOT rewrite targetUrl mid-scan
+    // (issues found earlier are already recorded correctly), just log.
+    {
+      const postKeyboardUrl = (() => {
+        try { return page.url(); } catch { return targetUrl; }
+      })();
+      if (!this.sameUrlWithoutHash(postKeyboardUrl, targetUrl)) {
+        logger.warn(`URL drifted from ${targetUrl} to ${postKeyboardUrl} during keyboard-navigation checks (likely an Enter key activated a link). Attempting to return before state scanning.`);
+        progress(`Recovering scan context: page drifted to ${postKeyboardUrl} during keyboard tests, returning to ${targetUrl}`);
+        const recovered = await this.navigateAndRecord(page, targetUrl, "recover after keyboardNav drift").catch(() => false);
+        if (recovered) {
+          await this.waitForMeaningfulPageContent(page, targetUrl);
+        } else {
+          const stillDrifted = (() => { try { return page.url(); } catch { return postKeyboardUrl; } })();
+          logger.warn(`Could not return to ${targetUrl} after keyboardNav; state and evidence phases will run on ${stillDrifted}. Report will note the drift.`);
+        }
+      }
+    }
+    // ═══════════════════════════════════════════════════════════════════════
 
     if (opts.run_states !== false) {
       progress(`Testing UI states (hover/focus/expanded/error) on ${targetUrl}`);
@@ -2056,9 +1906,6 @@ export class AccessibilityScanner {
       progress(`Capturing accessibility tree for ${targetUrl}`);
       const snapshot = await this.captureSnapshot(page, targetUrl, "initial", opts.capture_screenshots !== false);
       snapshot.a11yTree = this.withStateMatrixMetadata(snapshot.a11yTree, targetUrl, "initial", opts);
-      if (screenReaderReport) {
-        snapshot.screen_reader_report = screenReaderReport;
-      }
       this.domSnapshots.push(snapshot);
       this.recordTransitionNode(targetUrl, "initial", "initial", snapshot.screenshot);
     }
@@ -3519,9 +3366,45 @@ export class AccessibilityScanner {
   }
 
   private async attachIssueEvidence(page: any, issues: ScanIssue[]): Promise<void> {
-    const candidates = issues
-      .filter(issue => !issue.evidenceScreenshot && (issue.selector || issue.selectors?.[0]))
-      .slice(0, 80);
+    // Ship 1 / Item 6 — evidence completeness.
+    // 1. Bump the cap from 80 -> 200 so real reports don't lose screenshots
+    //    on medium-to-large scans.
+    // 2. For issues WITHOUT a usable selector, fall back to a full-page
+    //    screenshot so users still get visual context instead of a blank
+    //    evidence panel.
+    // 3. Log every skip reason so we can debug missing evidence in prod.
+    const EVIDENCE_CAP = 200;
+    const missingScreenshots = issues.filter(issue => !issue.evidenceScreenshot);
+    const withSelector = missingScreenshots.filter(issue => issue.selector || issue.selectors?.[0]);
+    const withoutSelector = missingScreenshots.filter(issue => !(issue.selector || issue.selectors?.[0]));
+    const candidates = withSelector.slice(0, EVIDENCE_CAP);
+    const skippedForCap = withSelector.length - candidates.length;
+    if (skippedForCap > 0) {
+      logger.warn(`Evidence capture: skipped ${skippedForCap} issue(s) with selector because the per-URL cap of ${EVIDENCE_CAP} was reached.`);
+    }
+    if (withoutSelector.length) {
+      logger.info(`Evidence capture: ${withoutSelector.length} issue(s) have no selector — will use a full-page fallback screenshot.`);
+    }
+
+    // Full-page fallback for issues that don't have a selector to highlight.
+    // Capture the fallback ONCE per URL and reuse it — pages don't change
+    // between issues at this point in the pipeline.
+    let fullPageFallback: string | undefined;
+    if (withoutSelector.length) {
+      try {
+        const buf = await page.screenshot({ type: "jpeg", quality: 62, fullPage: true });
+        fullPageFallback = `data:image/jpeg;base64,${buf.toString("base64")}`;
+      } catch (err) {
+        logger.warn("Evidence capture: full-page fallback screenshot failed:", err);
+      }
+    }
+    if (fullPageFallback) {
+      for (const issue of withoutSelector) {
+        issue.evidenceScreenshot = fullPageFallback;
+        issue.evidenceExplanation = issue.evidenceExplanation
+          || `Full-page fallback screenshot — this issue has no DOM selector to highlight (rule ${issue.ruleId}).`;
+      }
+    }
 
     for (const issue of candidates) {
       const selectors = Array.from(new Set([issue.selector, ...(issue.selectors || [])].filter(Boolean))) as string[];
@@ -3610,7 +3493,22 @@ export class AccessibilityScanner {
           return { found: true, visible: isVisible, selector: selectedSelector, affectedElements: uniqueLabels };
         }, { selectors, ruleId: issue.ruleId });
 
-        if (!captured?.found) continue;
+        if (!captured?.found) {
+          // Ship 1 / Item 6 — log skip reason so missing screenshots are debuggable.
+          logger.debug(`Evidence capture: element not found for ${issue.ruleId} (selectors: ${(issue.selectors || [issue.selector]).slice(0, 3).join(", ")}). Falling back to full-page screenshot.`);
+          // Give the user something rather than nothing.
+          if (!issue.evidenceScreenshot) {
+            try {
+              const buf = await page.screenshot({ type: "jpeg", quality: 62, fullPage: true });
+              issue.evidenceScreenshot = `data:image/jpeg;base64,${buf.toString("base64")}`;
+              issue.evidenceExplanation = issue.evidenceExplanation
+                || `Element for ${issue.ruleId} was not visible on the page at capture time — showing a full-page context screenshot instead.`;
+            } catch (fallbackErr) {
+              logger.warn(`Evidence capture: full-page fallback also failed for ${issue.ruleId}:`, fallbackErr);
+            }
+          }
+          continue;
+        }
         if (captured.selector) issue.selector = captured.selector;
         if (captured.affectedElements?.length) {
           issue.affectedElements = this.unique([...(issue.affectedElements || []), ...captured.affectedElements]).slice(0, 40);
@@ -3620,7 +3518,8 @@ export class AccessibilityScanner {
         issue.evidenceScreenshot = `data:image/jpeg;base64,${buf.toString("base64")}`;
         issue.evidenceExplanation = this.buildEvidenceExplanation(issue, captured.visible);
       } catch (err) {
-        logger.debug(`Issue evidence capture failed for ${issue.ruleId}:`, err);
+        // Ship 1 / Item 6 — surface capture failures instead of silently dropping them.
+        logger.warn(`Evidence capture failed for ${issue.ruleId} (${issue.url}):`, err);
       } finally {
         try {
           await page.evaluate(() => {
@@ -3667,15 +3566,26 @@ export class AccessibilityScanner {
 
 
   private calibrateIssues(issues: ScanIssue[]): ScanIssue[] {
-    return issues
-      .filter(issue => !this.isLikelyFalsePositive(issue))
-      .map(issue => {
-        const advisoryRules = /target-size-enhanced|fixed-font-size|text-truncation|complex-background|motion|gesture-no-alternative/i;
-        if (advisoryRules.test(issue.ruleId)) {
-          return { ...issue, category: "advisory", tags: this.unique([...(issue.tags || []), issue.wcag?.length ? "wcag-mapped" : "best-practice"]) };
-        }
-        return issue;
-      });
+    // Ship 1 / Item 7 — noise reduction.
+    // When the user opts in via `suppress_advisory_rules`, best-practice /
+    // advisory rules are DROPPED at this stage instead of being downgraded
+    // to the "advisory" category. Default behaviour is unchanged
+    // (downgrade only) so existing reports stay stable.
+    const advisoryRules = /target-size-enhanced|fixed-font-size|text-truncation|complex-background|motion|gesture-no-alternative/i;
+    const suppress = this.scan?.scan_options?.suppress_advisory_rules === true;
+    const filtered = issues.filter(issue => !this.isLikelyFalsePositive(issue));
+    if (suppress) {
+      const before = filtered.length;
+      const kept = filtered.filter(issue => !advisoryRules.test(issue.ruleId));
+      logger.info(`calibrateIssues: suppress_advisory_rules ON — dropped ${before - kept.length} advisory issue(s) (of ${before}).`);
+      return kept;
+    }
+    return filtered.map(issue => {
+      if (advisoryRules.test(issue.ruleId)) {
+        return { ...issue, category: "advisory", tags: this.unique([...(issue.tags || []), issue.wcag?.length ? "wcag-mapped" : "best-practice"]) };
+      }
+      return issue;
+    });
   }
 
   private isLikelyFalsePositive(issue: ScanIssue): boolean {
@@ -3686,6 +3596,47 @@ export class AccessibilityScanner {
     if (/focus:invisible/i.test(issue.ruleId) && /tabindex=['"]?-1/.test(selectorText)) return true;
     if ((issue.affectedCount || 1) <= 0) return true;
     return false;
+  }
+
+  /**
+   * Ship 2 / Item 5 — assign a `landmark_group_key` to issues whose selector
+   * clearly targets a landmark region (banner / contentinfo / navigation /
+   * main / complementary / region / search / form).
+   *
+   * The scan detail endpoint aggregates issues with the same key across
+   * URLs so cross-page duplicates (e.g. a footer rule firing on all 30
+   * pages of a crawl) collapse to one entry with a "Appears on N pages"
+   * badge instead of flooding the report.
+   *
+   * The key is intentionally URL-independent — otherwise cross-URL
+   * grouping wouldn't work. Format: `{ruleId}|{landmark}|{stem}` where
+   * `stem` strips positional indices and dynamic id suffixes.
+   */
+  private assignLandmarkGroupKeys(issues: ScanIssue[]): void {
+    const LANDMARK_ROLES = ["banner", "contentinfo", "navigation", "main", "complementary", "region", "search", "form"];
+    const landmarkRegex = new RegExp(`\\b(${LANDMARK_ROLES.join("|")})\\b`, "i");
+    for (const issue of issues) {
+      const haystack = [
+        issue.selector || "",
+        ...(issue.selectors || []),
+        ...(issue.affectedElements || []),
+      ].join(" ").toLowerCase();
+      const match = landmarkRegex.exec(haystack);
+      if (!match) continue;
+      const landmark = match[1];
+      // Build a URL-independent stem: keep only class/id-like tokens,
+      // strip [N] positional indices and any digits inside ids/classes
+      // (e.g. `#header-3` → `#header`) so the same landmark on different
+      // pages produces the same stem.
+      const rawSelector = String(issue.selector || issue.selectors?.[0] || "");
+      const stem = rawSelector
+        .replace(/\[\d+\]/g, "")           // strip positional [N]
+        .replace(/[-_]\d+/g, "")           // strip -N / _N suffixes
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+      (issue as any).landmark_group_key = `${issue.ruleId}|${landmark}|${stem}`;
+    }
   }
 
   private deduplicateIssues(issues: ScanIssue[]): ScanIssue[] {
@@ -3749,6 +3700,11 @@ export class AccessibilityScanner {
   }
 
   private generateTestCases(): void {
+    // Tier 3 fix — the previous version stored `steps: []` for every test
+    // case, so the printed PDF had a "Steps" column that was always empty.
+    // Now we template steps by rule family / category so a tester can act on
+    // them. This is still boilerplate; a fuller step catalog would live in
+    // a rule registry, but this at least stops the "empty steps" bug.
     const seen = new Set<string>();
     for (const issue of this.allIssues) {
       const key = `${issue.ruleId}|${this.scanPageKeyWithoutState(issue.url)}`;
@@ -3762,10 +3718,143 @@ export class AccessibilityScanner {
         status: "fail",
         issueRuleId: issue.ruleId,
         issueUrl: issue.url,
-        steps: [],
+        steps: this.stepsForIssue(issue),
         result: `FAIL — ${issue.message}`,
       });
     }
+  }
+
+  /**
+   * Derives concrete tester steps from an issue.
+   * Templates per rule family — this is intentionally simple and readable so a
+   * future rule registry can override it per-rule if needed.
+   */
+  private stepsForIssue(issue: ScanIssue): string[] {
+    const url = issue.url || "the affected page";
+    const sel = issue.selector || issue.selectors?.[0] || "the affected element";
+    const rule = issue.ruleId || "";
+
+    const common = [
+      `Open ${url} in the target browser.`,
+    ];
+
+    if (/^focus:invisible/.test(rule)) {
+      return [
+        ...common,
+        `Press Tab until focus lands on ${sel}.`,
+        `Confirm a visible focus indicator (outline, box-shadow, border, or background change) appears.`,
+        `Compare against the rest of the page — the indicator must have at least 3:1 contrast with adjacent colors (WCAG 2.4.11).`,
+      ];
+    }
+    if (/^focus:obscured/.test(rule)) {
+      return [
+        ...common,
+        `Press Tab until focus lands on ${sel}.`,
+        `Confirm the focused element is fully visible — not hidden behind a sticky header, cookie banner, modal, or overflow container.`,
+      ];
+    }
+    if (/^focus:trap-missing|focus:escape-key-missing/.test(rule)) {
+      return [
+        ...common,
+        `Open the dialog / modal identified by ${sel}.`,
+        `Press Tab repeatedly and confirm focus stays inside the dialog.`,
+        `Press Escape and confirm the dialog closes and focus returns to the trigger element.`,
+      ];
+    }
+    if (/^keyboard:custom-role-activation/.test(rule)) {
+      return [
+        ...common,
+        `Tab to ${sel}.`,
+        `Press Enter — confirm the same action fires as when clicking the element.`,
+        `Press Space (buttons only) — confirm activation.`,
+      ];
+    }
+    if (/^keyboard:skip-link-missing/.test(rule)) {
+      return [
+        ...common,
+        `Press Tab once from the top of the page.`,
+        `Confirm a "Skip to main content" (or equivalent) link appears and receives focus.`,
+        `Press Enter and confirm focus moves to the main landmark.`,
+      ];
+    }
+    if (/^keyboard:focus-loop|keyboard:mouse-only/.test(rule)) {
+      return [
+        ...common,
+        `Press Tab repeatedly until you reach the end of the page.`,
+        `Confirm every interactive control is reachable and the tab cycle does not repeat prematurely.`,
+      ];
+    }
+    if (/^pointer:target-size|heuristic:target-size/.test(rule)) {
+      return [
+        ...common,
+        `Inspect ${sel} in devtools and confirm width AND height are ≥ 24 CSS pixels (WCAG 2.5.8) or ≥ 44 CSS pixels for enhanced (2.5.5).`,
+        `On a touch device, confirm the element can be activated with a fingertip without accidental neighbor activation.`,
+      ];
+    }
+    if (/^zoom:reflow-failure|heuristic:reflow/.test(rule)) {
+      return [
+        ...common,
+        `Resize the browser window to 320×256 CSS pixels (or set zoom to 400%).`,
+        `Confirm content reflows: no horizontal scrolling required to reach any content, no clipping.`,
+      ];
+    }
+    if (/^zoom:intermediate-breakpoint-failure/.test(rule)) {
+      return [
+        ...common,
+        `Set browser zoom to 200%.`,
+        `Confirm ${sel} does not clip, overflow horizontally, or overlap adjacent content.`,
+      ];
+    }
+    if (/^zoom:viewport-locked/.test(rule)) {
+      return [
+        ...common,
+        `Open on a mobile device (or emulate one).`,
+        `Attempt to pinch-zoom the page. Confirm zoom is allowed up to at least 200%.`,
+      ];
+    }
+    if (/^zoom:fixed-font-size|heuristic:text-truncation/.test(rule)) {
+      return [
+        ...common,
+        `Increase browser default font size to 200% via the browser's Text Size setting.`,
+        `Confirm text at ${sel} scales up and does not clip or overlap.`,
+      ];
+    }
+    if (/^color:contrast-insufficient|color:focus-indicator/.test(rule)) {
+      return [
+        ...common,
+        `Use a contrast tool (WebAIM, Colour Contrast Analyser) on ${sel}.`,
+        `Confirm the ratio meets WCAG 1.4.3 (4.5:1 for normal text, 3:1 for large text and non-text UI).`,
+      ];
+    }
+    if (/^heuristic:reduced-motion|state:motion/.test(rule)) {
+      return [
+        ...common,
+        `Enable "Reduce motion" in your OS accessibility settings (System Preferences → Accessibility → Display on macOS; Settings → Ease of Access → Display on Windows).`,
+        `Reload the page. Confirm large animations (spinners, autoplay slideshows, parallax) either stop or become subtle.`,
+      ];
+    }
+    if (/^heuristic:heading-|heuristic:landmark-|structure/.test(rule)) {
+      return [
+        ...common,
+        `Open a screen reader (NVDA, JAWS, or VoiceOver).`,
+        `List headings (H shortcut in NVDA) or landmarks (D). Confirm the structure matches the visible page.`,
+      ];
+    }
+    if (/^state:error-not-associated|forms/.test(rule)) {
+      return [
+        ...common,
+        `Submit the form empty (or with invalid data).`,
+        `Confirm each error message is programmatically associated with its input via aria-describedby or aria-errormessage.`,
+        `Confirm a screen reader announces the error when focus enters the input.`,
+      ];
+    }
+    // Fallback — still better than an empty list.
+    return [
+      ...common,
+      `Locate ${sel}.`,
+      `Verify the condition described in the issue message: ${issue.message.slice(0, 160)}${issue.message.length > 160 ? "..." : ""}`,
+      `Apply the recommended fix and re-run this test case.`,
+    ];
   }
 
   private generateManualHybridReviewCases(): void {

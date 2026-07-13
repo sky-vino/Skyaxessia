@@ -162,12 +162,22 @@ export async function runZoomChecks(
   page: Page,
   url: string,
   state: string,
-  phase: string
+  phase: string,
+  /**
+   * Ship 1 / Item 4 — 400 (default) exercises WCAG 1.4.10 at 320px reflow (400% desktop-equivalent)
+   * PLUS the 200%/300% intermediate breakpoints. 200 tests only intermediate breakpoints and skips
+   * the 320px reflow test — matches this team's audit scenario.
+   */
+  zoomTargetPercent: 200 | 400 = 400
 ): Promise<ScanIssue[]> {
   const issues: ScanIssue[] = [];
   const zoomViewport = { width: 320, height: 568 };
   const originalVp = page.viewportSize() || { width: 1366, height: 768 };
   let baseline: UiSnapshot | null = null;
+  const runFourHundredReflow = zoomTargetPercent === 400;
+  if (!runFourHundredReflow) {
+    logger.info(`Zoom checks: 200% target selected for ${url} — skipping 320px reflow (WCAG 1.4.10 400% equivalent).`);
+  }
 
   const zoomLocked = await page.evaluate(() => {
     const meta = document.querySelector("meta[name='viewport']") as HTMLMetaElement | null;
@@ -229,7 +239,12 @@ export async function runZoomChecks(
       viewport: { width: number; height: number; scrollWidth: number };
       offenders: Array<{ selector: string; text: string; right: number; width: number; clipped: boolean }>;
     }> = [];
-    for (const zoomPercent of [200, 300]) {
+    // Ship 1 / Item 4 — when the audit target is 200%, only exercise the
+    // 200% intermediate breakpoint. 400% target keeps the 200%/300% pair so
+    // WCAG 1.4.10 auditors still see intermediate-breakpoint failures on the
+    // way to the 400% reflow test.
+    const intermediateBreakpoints = runFourHundredReflow ? [200, 300] : [200];
+    for (const zoomPercent of intermediateBreakpoints) {
       const factor = zoomPercent / 100;
       const viewport = {
         width: Math.max(320, Math.round(originalVp.width / factor)),
@@ -302,6 +317,16 @@ export async function runZoomChecks(
         ...evidence
       });
       await closeTransientUi(page);
+    }
+
+    // Ship 1 / Item 4 — everything from here to the end of the 320px reflow
+    // block is only relevant when the audit target is 400% (WCAG 1.4.10 desktop
+    // equivalent). Skip when the team's audit target is 200%.
+    if (!runFourHundredReflow) {
+      await page.setViewportSize(originalVp).catch(() => undefined);
+      await page.waitForTimeout(200).catch(() => undefined);
+      await restoreInjectedUi(page);
+      return issues;
     }
 
     await page.setViewportSize(zoomViewport);

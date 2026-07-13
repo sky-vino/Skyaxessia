@@ -230,6 +230,61 @@ config).
 
 ## Local development
 
+**One-time setup:**
+
+```powershell
+# 1. Backend environment
+cd backend
+Copy-Item ..\.env.example .\.env
+# Edit backend\.env if you want to override defaults.
+# Local dev works with the defaults below; leave Azure OpenAI blank
+# to skip AI features (scans still work, just no AI explanations).
+
+# 2. Install dependencies
+npm install
+npx playwright install chromium
+
+# 3. Start backend (runs on :4000)
+npm run dev
+```
+
+Wait for these three lines:
+```
+SQLite database ready at <path>\backend\data\accessibility.sqlite
+Scan queue initialized
+Axessia backend running on port 4000
+```
+
+**In a separate terminal — frontend:**
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Opens `http://localhost:3000`. Default admin login:
+
+- Email: `admin@axessia.local`
+- Password: `Admin@123`
+
+**If login says "Invalid credentials":** your `backend\.env` was seeded with different values (or is missing). Delete the DB and restart:
+
+```powershell
+cd backend
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data
+Remove-Item -Force -ErrorAction SilentlyContinue *.sqlite, *.sqlite-journal
+# Confirm backend\.env has DEFAULT_ADMIN_EMAIL and DEFAULT_ADMIN_PASSWORD
+Get-Content .env | Select-String "DEFAULT_ADMIN"
+npm run dev
+```
+
+Then log in with whatever `.env` shows.
+
+---
+
+
+
 ```bash
 # --- Backend ---
 cd backend

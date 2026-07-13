@@ -142,10 +142,32 @@ function severityRank(severity: string): number {
 }
 
 function wcagLevel(issue: any): "A" | "AA" | "AAA" | "Advisory" | "Needs review" {
-  const tags = asArray(issue.wcag_criteria).concat(asArray(issue.tags)).map(String).join(" ").toLowerCase();
-  if (/wcag\d*aaa|\baaa\b/.test(tags)) return "AAA";
-  if (/wcag\d*aa|\baa\b/.test(tags)) return "AA";
-  if (/wcag\d*a|\blevel a\b|\ba\b/.test(tags)) return "A";
+  // Ship 1 / Item 2 fix — the previous implementation regex-matched axe-core
+  // level tags (wcag2a / wcag22aa / wcag22aaa) on the joined string. Since the
+  // scanner + governance now emit criterion codes (2.4.11 / wcag2.4.11 / the
+  // compact "2411" form), every issue fell through to "Needs review" in the
+  // PDF while the dashboard bucketed them correctly. Fix: normalize each tag
+  // to a dotted criterion, look up its level in wcagCriterionLevels, and take
+  // the strictest present. Falls back to legacy axe level tags, then to a
+  // "best-practice" tag / "advisory" category check — mirroring the frontend
+  // logic in frontend/src/utils/wcag.ts so PDF and dashboard agree.
+  const rawTags = asArray(issue.wcag_criteria).concat(asArray(issue.tags)).map(String);
+  const found = new Set<"A" | "AA" | "AAA">();
+  for (const raw of rawTags) {
+    const criterion = wcagCriterionFromTag(raw);
+    if (criterion && wcagCriterionLevels[criterion]) {
+      found.add(wcagCriterionLevels[criterion]);
+      continue;
+    }
+    const lower = raw.toLowerCase().trim();
+    if (/^wcag\d*aaa$/.test(lower)) found.add("AAA");
+    else if (/^wcag\d*aa$/.test(lower)) found.add("AA");
+    else if (/^wcag\d*a$/.test(lower)) found.add("A");
+  }
+  if (found.has("A")) return "A";
+  if (found.has("AA")) return "AA";
+  if (found.has("AAA")) return "AAA";
+  if (rawTags.some(tag => tag.toLowerCase() === "best-practice")) return "Advisory";
   if (String(issue.category || "").toLowerCase() === "advisory") return "Advisory";
   return "Needs review";
 }
@@ -155,7 +177,13 @@ const wcagCriterionLevels: Record<string, "A" | "AA" | "AAA"> = {
   "2.1.1": "A", "2.1.2": "A", "2.2.1": "A", "2.2.2": "A", "2.3.1": "A", "2.4.1": "A", "2.4.2": "A", "2.4.3": "A", "2.4.4": "A",
   "3.1.1": "A", "3.2.1": "A", "3.2.2": "A", "3.3.1": "A", "3.3.2": "A", "4.1.1": "A", "4.1.2": "A",
   "1.2.4": "AA", "1.2.5": "AA", "1.3.4": "AA", "1.3.5": "AA", "1.4.3": "AA", "1.4.4": "AA", "1.4.5": "AA", "1.4.10": "AA", "1.4.11": "AA", "1.4.12": "AA", "1.4.13": "AA",
-  "2.4.5": "AA", "2.4.6": "AA", "2.4.7": "AA", "2.4.11": "AA", "2.4.12": "AA", "2.5.7": "AA", "2.5.8": "AA",
+  "2.4.5": "AA", "2.4.6": "AA", "2.4.7": "AA", "2.4.11": "AA", "2.5.7": "AA", "2.5.8": "AA",
+  // Tier 3 fix — WCAG 2.4.12 "Focus Not Obscured (Enhanced)" is AAA per the
+  // WCAG 2.2 spec. Previously this file had it as AA, which contradicted both
+  // the frontend (frontend/src/utils/wcag.ts) and the governance service
+  // (backend/src/services/wcagGovernanceService.ts). PDF and dashboard would
+  // disagree on the level of this criterion.
+  "2.4.12": "AAA",
   "3.1.2": "AA", "3.2.3": "AA", "3.2.4": "AA", "3.3.3": "AA", "3.3.4": "AA", "3.3.7": "AA", "3.3.8": "AA", "4.1.3": "AA",
   "1.2.6": "AAA", "1.2.7": "AAA", "1.2.8": "AAA", "1.2.9": "AAA", "1.3.6": "AAA", "1.4.6": "AAA", "1.4.7": "AAA", "1.4.8": "AAA", "1.4.9": "AAA",
   "2.1.3": "AAA", "2.2.3": "AAA", "2.2.4": "AAA", "2.2.5": "AAA", "2.2.6": "AAA", "2.3.2": "AAA", "2.3.3": "AAA", "2.4.8": "AAA", "2.4.9": "AAA", "2.4.10": "AAA", "2.4.13": "AAA", "2.5.5": "AAA", "2.5.6": "AAA",
@@ -332,7 +360,30 @@ export async function generateScanReport(scanId: string, requestedSections?: str
   const startedAt = scan.started_at ? new Date(scan.started_at) : null;
   const completedAt = scan.completed_at ? new Date(scan.completed_at) : null;
 
-  const sortedIssues = [...unresolvedIssues].sort((a: any, b: any) =>
+  // Ship 2 / Item 5 — cross-URL landmark grouping. Same logic as
+  // /api/issues route, applied here so the PDF matches the dashboard.
+  // Non-landmark issues (landmark_group_key NULL) pass through unchanged.
+  const landmarkGroups = new Map<string, any[]>();
+  const singletons: any[] = [];
+  for (const issue of unresolvedIssues) {
+    const key = issue.landmark_group_key;
+    if (!key) { singletons.push(issue); continue; }
+    if (!landmarkGroups.has(key)) landmarkGroups.set(key, []);
+    landmarkGroups.get(key)!.push(issue);
+  }
+  const groupedIssues: any[] = [];
+  for (const items of landmarkGroups.values()) {
+    items.sort((a: any, b: any) => (a.priority || 5) - (b.priority || 5));
+    const primary = items[0];
+    const pageUrls = Array.from(new Set(items.map((it: any) => it.url).filter(Boolean)));
+    groupedIssues.push({ ...primary, page_occurrences: pageUrls.length, page_urls: pageUrls });
+  }
+  const enrichedIssues = [
+    ...singletons.map((it: any) => ({ ...it, page_occurrences: 1, page_urls: [it.url].filter(Boolean) })),
+    ...groupedIssues,
+  ];
+
+  const sortedIssues = [...enrichedIssues].sort((a: any, b: any) =>
     (a.priority || 5) - (b.priority || 5) || severityRank(a.severity) - severityRank(b.severity)
   );
 
@@ -376,23 +427,42 @@ export async function generateScanReport(scanId: string, requestedSections?: str
     const category = String(issue.category || "wcag").toLowerCase();
     acc[category] = (acc[category] || 0) + 1;
     return acc;
-  }, {});
-  const categoryChartRows = Object.entries(categoryCounts)
-    .sort((a, b) => Number(b[1]) - Number(a[1]))
+  }, {} as Record<string, number>);
+  // TypeScript widens Object.entries to [string, unknown][] regardless of
+  // input type; cast so the `count` argument keeps its number typing.
+  const categoryChartRows = (Object.entries(categoryCounts) as Array<[string, number]>)
+    .sort((a, b) => b[1] - a[1])
     .slice(0, 6)
     .map(([label, count], index) => {
       const colors = ["#0f766e", "#7c3aed", "#ff4d6d", "#ff9f43", "#ffd60a", "#0891b2"];
-      return `<div class="chart-row"><span>${escapeHtml(label)}</span><div><i style="width:${percent(Number(count), unresolvedIssues.length || 0)}%;background:${colors[index % colors.length]}"></i></div><b>${count}</b></div>`;
+      return `<div class="chart-row"><span>${escapeHtml(label)}</span><div><i style="width:${percent(count, unresolvedIssues.length || 0)}%;background:${colors[index % colors.length]}"></i></div><b>${count}</b></div>`;
     }).join("");
   const principleForIssue = (issue: any): string => {
-    const text = asArray(issue.wcag_criteria).concat(asArray(issue.tags)).join(" ").toLowerCase();
-    if (/1\./.test(text)) return "Perceivable";
-    if (/2\./.test(text)) return "Operable";
-    if (/3\./.test(text)) return "Understandable";
-    if (/4\./.test(text)) return "Robust";
-    if (/keyboard|focus|pointer|target|zoom|reflow/i.test(`${issue.category} ${issue.rule_id}`)) return "Operable";
-    if (/label|error|input|form/i.test(`${issue.category} ${issue.rule_id}`)) return "Understandable";
-    if (/aria|role|name/i.test(`${issue.category} ${issue.rule_id}`)) return "Robust";
+    // Ship 1 / Item 2 fix — the old regex .test on the joined tag string had
+    // false positives: /1\./ matches "1." anywhere, so a 2.x criterion like
+    // "2.4.11" (contains "1.1") was miscounted as Perceivable instead of
+    // Operable. Fix: canonicalise each tag to a criterion and read the leading
+    // digit. Falls back to the category / rule_id heuristic only when no WCAG
+    // criterion is present at all.
+    const rawTags = asArray(issue.wcag_criteria).concat(asArray(issue.tags)).map(String);
+    const principles = new Set<string>();
+    for (const raw of rawTags) {
+      const criterion = wcagCriterionFromTag(raw);
+      if (!criterion) continue;
+      const first = criterion[0];
+      if (first === "1") principles.add("Perceivable");
+      else if (first === "2") principles.add("Operable");
+      else if (first === "3") principles.add("Understandable");
+      else if (first === "4") principles.add("Robust");
+    }
+    if (principles.has("Perceivable")) return "Perceivable";
+    if (principles.has("Operable")) return "Operable";
+    if (principles.has("Understandable")) return "Understandable";
+    if (principles.has("Robust")) return "Robust";
+    const catRule = `${issue.category || ""} ${issue.rule_id || ""}`.toLowerCase();
+    if (/keyboard|focus|pointer|target|zoom|reflow/.test(catRule)) return "Operable";
+    if (/label|error|input|form/.test(catRule)) return "Understandable";
+    if (/aria|role|name/.test(catRule)) return "Robust";
     return "Needs review";
   };
   const principleCounts = unresolvedIssues.reduce((acc: Record<string, number>, issue: any) => {
@@ -450,6 +520,9 @@ export async function generateScanReport(scanId: string, requestedSections?: str
             <div class="issue-main">
               <strong>${escapeHtml(title)}</strong>
               <span class="muted">${escapeHtml(selectorName)}${affectedCount(issue) > 1 ? ` - ${affectedCount(issue)} grouped elements` : ""}</span>
+              ${issue.page_occurrences && issue.page_occurrences > 1
+                ? `<span class="muted" style="color:#a78bfa;font-weight:600">Appears on ${issue.page_occurrences} pages: ${escapeHtml((issue.page_urls || []).slice(0, 3).map(compactUrl).join(", "))}${(issue.page_urls || []).length > 3 ? " …" : ""}</span>`
+                : ""}
               <span class="print-only print-meta">${escapeHtml(compactUrl(pageUrl))} | ${escapeHtml(issueId)}</span>
             </div>
           </td>

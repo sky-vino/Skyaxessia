@@ -1,65 +1,28 @@
-import { AzureOpenAI } from "openai";
+import OpenAI from "openai";
 import { logger } from "../utils/logger";
 
 interface AiResult {
   explanation: string;
   impact: string;
   fix_code: string;
+  // Tier 4 fix — distinguishes real AI-generated content from the canned
+  // fallback strings so the UI can badge it clearly. Previously the fallback
+  // strings were displayed as if the AI had answered, and users had no way
+  // to know whether the AI call actually succeeded.
+  source: "ai" | "fallback";
+  // Populated only when source === "fallback"; describes why the fallback fired.
+  fallback_reason?: string;
 }
 
-/**
- * Azure OpenAI–backed accessibility explanation service.
- *
- * Reads its configuration from Azure App Service environment variables:
- *   AZURE_OPENAI_ENDPOINT      e.g. https://my-resource.openai.azure.com
- *   AZURE_OPENAI_KEY           the resource key (also accepts AZURE_OPENAI_API_KEY)
- *   AZURE_OPENAI_DEPLOYMENT    the deployment name of a chat model (e.g. gpt-4o)
- *   AZURE_OPENAI_API_VERSION   the API version (defaults to 2024-10-21)
- *
- * If any of endpoint / key / deployment is missing, the service degrades
- * gracefully: it logs a warning once and returns a deterministic fallback
- * explanation so scans still complete successfully.
- */
 class AiService {
-  private client?: AzureOpenAI;
-  private warnedMissingConfig = false;
+  private client?: OpenAI;
 
-  private deploymentName(): string {
-    return (
-      process.env.AZURE_OPENAI_DEPLOYMENT ||
-      process.env.AZURE_OPENAI_DEPLOYMENT_NAME ||
-      "gpt-4o"
-    );
-  }
-
-  private apiVersion(): string {
-    return process.env.AZURE_OPENAI_API_VERSION || "2024-10-21";
-  }
-
-  private azureOpenai(): AzureOpenAI | null {
-    const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
-    const apiKey = process.env.AZURE_OPENAI_KEY || process.env.AZURE_OPENAI_API_KEY;
-    const deployment = this.deploymentName();
-
-    if (!endpoint || !apiKey || !deployment) {
-      if (!this.warnedMissingConfig) {
-        this.warnedMissingConfig = true;
-        logger.warn(
-          "Azure OpenAI is not fully configured. Missing one or more of: " +
-            "AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT. " +
-            "AI explanations will use the deterministic fallback."
-        );
-      }
+  private openai(): OpenAI | null {
+    if (!process.env.OPENAI_API_KEY) {
       return null;
     }
-
     if (!this.client) {
-      this.client = new AzureOpenAI({
-        endpoint,
-        apiKey,
-        apiVersion: this.apiVersion(),
-        deployment
-      });
+      this.client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     }
     return this.client;
   }
@@ -86,30 +49,38 @@ Respond in JSON format:
   "fix_code": "// Before:\\n...\\n\\n// After:\\n..."
 }`;
 
-    const client = this.azureOpenai();
-    if (!client) {
-      return this.fallbackExplain(issue);
-    }
-
     try {
-      const response = await client.chat.completions.create({
-        model: this.deploymentName(),
+      const openai = this.openai();
+      if (!openai) {
+        throw new Error("OPENAI_API_KEY is not configured");
+      }
+
+      const response = await openai.chat.completions.create({
+        model: process.env.OPENAI_MODEL || "gpt-4o",
         messages: [{ role: "user", content: prompt }],
         response_format: { type: "json_object" },
         max_tokens: 1000,
         temperature: 0.3
       });
 
-      const text = response.choices[0]?.message?.content || "{}";
+      const text = response.choices[0].message.content || "{}";
       const parsed = JSON.parse(text);
       return {
         explanation: parsed.explanation || "Unable to generate explanation.",
         impact: parsed.impact || "Unable to determine impact.",
-        fix_code: parsed.fix_code || "// No fix code generated."
+        fix_code: parsed.fix_code || "// No fix code generated.",
+        source: "ai",
       };
     } catch (err) {
-      logger.error("Azure OpenAI explainIssue failed:", err);
-      return this.fallbackExplain(issue);
+      logger.error("AI explain failed:", err);
+      const reason = err instanceof Error ? err.message : String(err);
+      return {
+        explanation: `${issue.message} — This accessibility issue affects users relying on assistive technologies.`,
+        impact: "Users with disabilities, particularly those using screen readers or keyboard navigation, may be impacted.",
+        fix_code: "// Please refer to WCAG documentation for fix guidance.",
+        source: "fallback",
+        fallback_reason: reason,
+      };
     }
   }
 
@@ -119,34 +90,24 @@ Rule: ${issue.rule_id}, WCAG: ${(issue.wcag_criteria || []).join(", ")}, Message
 
 Respond in JSON: { "test_cases": [{ "name": "", "description": "", "steps": [], "expected_result": "" }] }`;
 
-    const client = this.azureOpenai();
-    if (!client) {
-      return [];
-    }
-
     try {
-      const response = await client.chat.completions.create({
-        model: this.deploymentName(),
+      const openai = this.openai();
+      if (!openai) {
+        return [];
+      }
+
+      const response = await openai.chat.completions.create({
+        model: process.env.OPENAI_MODEL || "gpt-4o",
         messages: [{ role: "user", content: prompt }],
         response_format: { type: "json_object" },
         max_tokens: 800,
         temperature: 0.3
       });
-      const parsed = JSON.parse(response.choices[0]?.message?.content || "{}");
+      const parsed = JSON.parse(response.choices[0].message.content || "{}");
       return parsed.test_cases || [];
-    } catch (err) {
-      logger.warn("Azure OpenAI generateTestCases failed:", err);
+    } catch {
       return [];
     }
-  }
-
-  private fallbackExplain(issue: any): AiResult {
-    return {
-      explanation: `${issue.message} — This accessibility issue affects users relying on assistive technologies.`,
-      impact:
-        "Users with disabilities, particularly those using screen readers or keyboard navigation, may be impacted.",
-      fix_code: "// Please refer to WCAG documentation for fix guidance."
-    };
   }
 }
 

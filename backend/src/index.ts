@@ -19,6 +19,7 @@ import { projectRouter } from "./routes/projects";
 import { userRouter } from "./routes/users";
 import { wcagGovernanceRouter } from "./routes/wcagGovernance";
 import { extensionSessionRouter } from "./routes/extensionSessions";
+import { authSessionRouter } from "./routes/authSessions";
 import { wsManager } from "./utils/wsManager";
 import { scanQueue } from "./services/scanQueue";
 import { ensureWcagGovernanceReady } from "./services/wcagGovernanceService";
@@ -74,6 +75,7 @@ app.use("/api/projects", projectRouter);
 app.use("/api/users", userRouter);
 app.use("/api/wcag-governance", wcagGovernanceRouter);
 app.use("/api/extension-sessions", extensionSessionRouter);
+app.use("/api/auth-sessions", authSessionRouter);
 
 app.get("/api/health", (_req, res) => {
   res.json({

@@ -70,7 +70,27 @@ export const scanApi = {
   delete: (id: string) => api.delete(`/scans/${id}`),
   domSnapshots: (id: string) => api.get(`/scans/${id}/dom-snapshots`),
   testCases: (id: string) => api.get(`/scans/${id}/test-cases`),
-  updateTestCase: (scanId: string, testCaseId: string, data: any) => api.patch(`/scans/${scanId}/test-cases/${testCaseId}`, data)
+  updateTestCase: (scanId: string, testCaseId: string, data: any) => api.patch(`/scans/${scanId}/test-cases/${testCaseId}`, data),
+  authTraces: (id: string) => api.get(`/scans/${id}/auth-traces`),
+  authTraceDownload: (id: string, filename: string) =>
+    api.get(`/scans/${id}/auth-trace`, { params: { filename }, responseType: "blob" })
+};
+
+// Production authenticated-scan flow with manual OTP entry.
+// See backend/src/services/authSessionManager.ts for the state machine.
+export const authSessionApi = {
+  start: (data: {
+    target_url: string;
+    username: string;
+    password: string;
+    otp_channel?: "email" | "sms";
+    scan_name?: string;
+    scan_options?: any;
+    project_id?: string;
+  }) => api.post("/auth-sessions", data),
+  poll: (id: string) => api.get(`/auth-sessions/${id}`),
+  submitOtp: (id: string, otp: string) => api.post(`/auth-sessions/${id}/otp`, { otp }),
+  cancel: (id: string) => api.delete(`/auth-sessions/${id}`),
 };
 
 export const issueApi = {

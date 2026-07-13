@@ -132,10 +132,33 @@ export async function runKeyboardNav(
     await waitForStability(page, 100);
 
     for (let i = 0; i < MAX_TABS; i++) {
+      // Ship 2 / A2 fix — build a STABLE selector using the element's DOM path
+      // (parent chain + child index), so the same element always produces the
+      // same string across Tab iterations. The prior version generated
+      // `${tag}.${cls}[tab-${iteration}]`, which is different per iteration and
+      // silently prevented `focusPath.includes(focused)` from ever matching
+      // for id-less elements. Loops involving id-less elements were being
+      // under-reported.
       const focused = await page.evaluate(() => {
-        const el = document.activeElement as HTMLElement;
+        const el = document.activeElement as HTMLElement | null;
         if (!el || el === document.body) return null;
-        return el.id ? `${el.tagName.toLowerCase()}#${el.id}` : `${el.tagName.toLowerCase()}[${i}]`;
+        if (el.id) return `${el.tagName.toLowerCase()}#${el.id}`;
+        const path: string[] = [];
+        let cur: HTMLElement | null = el;
+        let depth = 0;
+        while (cur && cur !== document.body && depth < 6) {
+          const parent = cur.parentElement;
+          if (!parent) break;
+          const idx = Array.from(parent.children).indexOf(cur);
+          const cls = String(cur.className || "").split(/\s+/).filter(Boolean)[0];
+          const seg = cls
+            ? `${cur.tagName.toLowerCase()}.${cls}[${idx}]`
+            : `${cur.tagName.toLowerCase()}[${idx}]`;
+          path.unshift(seg);
+          cur = parent;
+          depth++;
+        }
+        return path.join(">") || el.tagName.toLowerCase();
       });
 
       if (focused) {
@@ -150,11 +173,32 @@ export async function runKeyboardNav(
     }
 
     if (loopDetected) {
+      // Ship 2 / A2 fix — widen the valid-trap check. Original only excluded
+      // aria-modal dialogs and native <dialog[open]>. Also exclude:
+      //   - role="alertdialog"
+      //   - elements/ancestors marked data-focus-trap or data-modal-open
+      //   - alertdialogs / modals identified by common class patterns
       const validModalTrap = await page.evaluate(() => {
         const active = document.activeElement as HTMLElement | null;
-        return Boolean(active?.closest?.("[role='dialog'][aria-modal='true'],dialog[open]"));
+        if (!active) return false;
+        const traps = [
+          "[role='dialog'][aria-modal='true']",
+          "[role='alertdialog']",
+          "dialog[open]",
+          "[data-focus-trap]",
+          "[data-modal-open='true']",
+          ".modal.show",
+          ".modal-open",
+        ];
+        return traps.some(sel => Boolean(active.closest?.(sel)));
       }).catch(() => false);
       if (validModalTrap) loopDetected = false;
+    }
+
+    // Ship 2 / A2 fix — debug-log the observed focus path so a false-positive
+    // report can be re-traced without adding logging on a separate run.
+    if (loopDetected) {
+      logger.debug(`focus-loop detected on ${url}. Full focus path (${focusPath.length} steps): ${focusPath.join(" -> ")}`);
     }
 
     if (loopDetected) {
@@ -243,24 +287,115 @@ export async function runKeyboardNav(
         .slice(0, 10);
     });
 
-    for (const sel of customButtons.slice(0, 3)) {
+    // Tier 1 fix — real Enter-response test.
+    //
+    // Previous version pressed Enter but discarded the result, and unconditionally
+    // pushed an issue whenever any custom-role element existed. That was theatre.
+    //
+    // New behaviour: for each candidate (up to 10), snapshot a lightweight DOM
+    // signature (URL, doc height, child count, aria-expanded/pressed), press
+    // Enter via Playwright (real OS-level input, activates real listeners), then
+    // re-snapshot. Only elements that produced NO observable change are flagged.
+    // If Enter caused a navigation we stop the test to preserve page context —
+    // the elements we already tested are still valid results — and then
+    // navigate back to where we started so downstream phases (state scanner,
+    // evidence capture) don't run on a wrong page.
+    const preTestUrl = (() => { try { return page.url(); } catch { return ""; } })();
+    const responsive: string[] = [];
+    const unresponsive: string[] = [];
+    const notTested: string[] = [];
+    const candidates = customButtons.slice(0, 10);
+    let navigatedAway = false;
+    let testedCount = 0;
+
+    for (const sel of candidates) {
+      if (navigatedAway) {
+        notTested.push(sel);
+        continue;
+      }
       try {
-        await page.focus(sel);
-        const beforeUrl = page.url();
+        await page.focus(sel, { timeout: 1500 });
+        await waitForStability(page, 120);
+        const before = await page.evaluate((s: string) => {
+          const el = document.querySelector(s);
+          return {
+            url: window.location.href,
+            docHeight: document.documentElement.scrollHeight,
+            childCount: document.body ? document.body.querySelectorAll("*").length : 0,
+            ariaExpanded: el ? el.getAttribute("aria-expanded") : null,
+            ariaPressed: el ? el.getAttribute("aria-pressed") : null,
+            activeSelector: (document.activeElement as HTMLElement | null)?.tagName || "",
+          };
+        }, sel);
+
         await page.keyboard.press("Enter");
-        await waitForStability(page, 300);
-        // If nothing happened (no navigation, no DOM change), flag it
-        const afterUrl = page.url();
-        // We can't easily detect DOM changes, so just check for role mismatch
-      } catch {}
+        await waitForStability(page, 400);
+
+        const after = await page.evaluate((s: string) => {
+          const el = document.querySelector(s);
+          return {
+            url: window.location.href,
+            docHeight: document.documentElement.scrollHeight,
+            childCount: document.body ? document.body.querySelectorAll("*").length : 0,
+            ariaExpanded: el ? el.getAttribute("aria-expanded") : null,
+            ariaPressed: el ? el.getAttribute("aria-pressed") : null,
+            activeSelector: (document.activeElement as HTMLElement | null)?.tagName || "",
+          };
+        }, sel);
+
+        testedCount++;
+
+        if (before.url !== after.url) {
+          // Enter navigated — that IS a response. Stop further tests so we don't
+          // measure a totally different page.
+          responsive.push(sel);
+          navigatedAway = true;
+          continue;
+        }
+
+        const responded =
+          Math.abs(before.docHeight - after.docHeight) > 4 ||
+          before.childCount !== after.childCount ||
+          before.ariaExpanded !== after.ariaExpanded ||
+          before.ariaPressed !== after.ariaPressed;
+
+        if (responded) responsive.push(sel);
+        else unresponsive.push(sel);
+      } catch (err) {
+        // Focus/keyboard failed — we can't say whether the element would have
+        // responded, so we don't count it as a failure.
+        logger.debug(`Custom role Enter test could not run for ${sel}:`, err);
+        notTested.push(sel);
+      }
     }
 
-    if (customButtons.length > 0) {
+    // Restore the pre-test page if an Enter press navigated us away.
+    if (navigatedAway && preTestUrl) {
+      const now = (() => { try { return page.url(); } catch { return preTestUrl; } })();
+      if (now !== preTestUrl) {
+        logger.debug(`Custom-role Enter test navigated to ${now}; restoring pre-test page ${preTestUrl}.`);
+        try {
+          await page.goto(preTestUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+          await waitForStability(page, 400);
+        } catch (err) {
+          logger.debug("Could not restore pre-test URL after custom-role Enter navigated:", err);
+        }
+      }
+    }
+
+    if (unresponsive.length > 0) {
+      const totalDetected = customButtons.length;
+      const detail = notTested.length
+        ? ` ${notTested.length} additional element(s) could not be tested in this run.`
+        : "";
+      const extras = totalDetected > candidates.length
+        ? ` ${totalDetected - candidates.length} additional custom-role element(s) beyond the ${candidates.length} tested were not exercised.`
+        : "";
       issues.push({
         ruleId: "keyboard:custom-role-activation",
-        severity: "moderate", priority: 3, category: "keyboard",
-        message: `${customButtons.length} custom role='button' / role='link' elements detected. Verify they respond to Enter and Space keys.`,
-        url, selector: customButtons[0], selectors: customButtons, depths: customButtons.map(() => 0),
+        severity: "serious", priority: 2, category: "keyboard",
+        message: `${unresponsive.length} custom role='button' / role='link' element(s) did not produce any observable DOM change when the Enter key was pressed while focused (${testedCount} tested).${detail}${extras}`,
+        url, selector: unresponsive[0], selectors: unresponsive, depths: unresponsive.map(() => 0),
         wcag: ["wcag2.1.1"],
         fixSuggestion: "Custom interactive elements need keydown handlers for Enter (buttons and links) and Space (buttons). Use native <button> or <a> when possible.",
         state, phase: "keyboard",

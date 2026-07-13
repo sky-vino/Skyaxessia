@@ -26,10 +26,7 @@ const jsonColumns = new Set([
 const booleanColumns = new Set(["is_active", "is_resolved", "false_positive"]);
 
 function sqlitePath(): string {
-  const configured =
-    process.env.SQLITE_PATH ||
-    process.env.DATABASE_URL ||
-    "data/accessibility.sqlite";
+  const configured = process.env.SQLITE_PATH || process.env.DATABASE_URL || "data/accessibility.sqlite";
   if (configured.startsWith("sqlite://")) {
     return configured.slice("sqlite://".length);
   }
@@ -39,8 +36,7 @@ function sqlitePath(): string {
 function normalizeValue(value: any): any {
   if (typeof value === "boolean") return value ? 1 : 0;
   if (Array.isArray(value)) return JSON.stringify(value);
-  if (value && typeof value === "object" && !(value instanceof Date))
-    return JSON.stringify(value);
+  if (value && typeof value === "object" && !(value instanceof Date)) return JSON.stringify(value);
   return value;
 }
 
@@ -98,10 +94,7 @@ class SqlitePool {
     });
 
     await this.connection.exec("PRAGMA foreign_keys = ON;");
-    const schema = await fs.readFile(
-      path.resolve(process.cwd(), "migrations", "init.sqlite.sql"),
-      "utf8"
-    );
+    const schema = await fs.readFile(path.resolve(process.cwd(), "migrations", "init.sqlite.sql"), "utf8");
     await this.connection.exec(schema);
     await this.ensureIssueEvidenceColumns();
     await this.ensureScanNavigationColumns();
@@ -129,6 +122,12 @@ class SqlitePool {
     }
     if (!existing.has("evidence_explanation")) {
       await this.connection!.exec("ALTER TABLE issues ADD COLUMN evidence_explanation TEXT;");
+    }
+    // Ship 2 / Item 5 — landmark_group_key enables cross-URL grouping of
+    // landmark-scoped issues. Nullable — non-landmark issues leave it NULL
+    // and behave exactly as before.
+    if (!existing.has("landmark_group_key")) {
+      await this.connection!.exec("ALTER TABLE issues ADD COLUMN landmark_group_key TEXT;");
     }
   }
 
@@ -241,8 +240,38 @@ class SqlitePool {
   }
 
   private async ensureDefaultAdmin(): Promise<void> {
-    const email = process.env.DEFAULT_ADMIN_EMAIL || "admin@axessia.local";
-    const password = process.env.DEFAULT_ADMIN_PASSWORD || "Admin@123";
+    // Tier 3 fix — production must not silently seed a hardcoded password.
+    // Behaviour:
+    //   - If DEFAULT_ADMIN_PASSWORD is set, use it (any env).
+    //   - Else in production: throw at startup so ops must configure it.
+    //   - Else in dev/test: warn loudly and use the fallback so local runs work.
+    const email = process.env.DEFAULT_ADMIN_EMAIL || "admin@accessibility.local";
+    const envPassword = process.env.DEFAULT_ADMIN_PASSWORD;
+    const isProd = process.env.NODE_ENV === "production";
+
+    if (!envPassword && isProd) {
+      const err = new Error(
+        "SECURITY: DEFAULT_ADMIN_PASSWORD is not set and NODE_ENV=production. " +
+        "Refusing to seed a hardcoded admin password in production. " +
+        "Set DEFAULT_ADMIN_PASSWORD (and DEFAULT_ADMIN_EMAIL) via Azure App Settings " +
+        "or Key Vault reference, then restart."
+      );
+      throw err;
+    }
+
+    const password = envPassword || "Admin@123";
+    if (!envPassword) {
+      // Loud dev warning — never appears in production because we threw above.
+      // Use console.warn so it survives even if the logger is misconfigured.
+      // eslint-disable-next-line no-console
+      console.warn(
+        "\n============================================================\n" +
+        "  ⚠  Seeding admin with the DEFAULT PASSWORD 'Admin@123'.\n" +
+        "     This is acceptable ONLY for local development.\n" +
+        "     Set DEFAULT_ADMIN_PASSWORD before deploying anywhere.\n" +
+        "============================================================\n"
+      );
+    }
     const hash = await bcrypt.hash(password, 12);
 
     await this.connection!.run(
@@ -258,6 +287,21 @@ class SqlitePool {
   }
 
   private async ensureDefaultUsers(): Promise<void> {
+    // Tier 3 fix — the previous version unconditionally seeded user1-user5
+    // with the hardcoded password "Accessibility" on every boot, including
+    // production. Now: skip entirely unless SEED_DEMO_USERS=true is explicitly
+    // set. Dev default is skip too — set the env var when you actually want
+    // demo accounts.
+    if (process.env.SEED_DEMO_USERS !== "true") {
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.warn(
+      "\n============================================================\n" +
+      "  ⚠  Seeding demo users user1..user5 with password 'Accessibility'.\n" +
+      "     SEED_DEMO_USERS=true was explicitly set. Only use this in dev.\n" +
+      "============================================================\n"
+    );
     const password = "Accessibility";
     const hash = await bcrypt.hash(password, 12);
     for (let index = 1; index <= 5; index++) {
@@ -279,8 +323,7 @@ class SqlitePool {
   async query<T = any>(sql: string, params: any[] = []): Promise<QueryResult<T>> {
     await this.ready;
     const query = toSqlite(sql, params);
-    const returnsRows =
-      /^\s*(SELECT|WITH|PRAGMA)\b/i.test(query.sql) || /\bRETURNING\b/i.test(query.sql);
+    const returnsRows = /^\s*(SELECT|WITH|PRAGMA)\b/i.test(query.sql) || /\bRETURNING\b/i.test(query.sql);
 
     if (returnsRows) {
       const rows = await this.connection!.all(query.sql, query.params);

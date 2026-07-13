@@ -71,8 +71,8 @@ class ScanQueue {
         const insertedIssue = await db.query(
           `INSERT INTO issues (scan_id, rule_id, severity, priority, category, message, url,
             selector, selectors, affected_elements, depths, wcag_criteria, act_rules, tags, help_url, html_snippet,
-            fix_suggestion, evidence_screenshot, evidence_explanation, component_id, component_owner, source_hint, state_label, phase)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING id`,
+            fix_suggestion, evidence_screenshot, evidence_explanation, component_id, component_owner, source_hint, state_label, phase, landmark_group_key)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) RETURNING id`,
           [
             scanId, issue.ruleId, issue.severity, issue.priority || 3,
             issue.category || "wcag", issue.message, issue.url,
@@ -92,7 +92,8 @@ class ScanQueue {
             issue.componentOwner || null,
             issue.sourceHint || null,
             issue.state || "default",
-            issue.phase || "initial"
+            issue.phase || "initial",
+            (issue as any).landmark_group_key || null
           ]
         );
               const linkKey = issueLinkKey(issue.ruleId, issue.url);

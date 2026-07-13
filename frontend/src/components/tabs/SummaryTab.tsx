@@ -51,6 +51,26 @@ export default function SummaryTab({ scan }: { scan: any }) {
   });
 
   const issues = issuesData?.data?.issues || [];
+
+  // -------------------------------------------------------------------------
+  // Reconcile with the PDF report: the report renders counts using only
+  // unresolved issues (issues.filter(i => !i.is_resolved)). Historically this
+  // tab showed the STORED scan.total_issues / scan.[severity]_count, which are
+  // frozen at scan-completion time and drift the moment anyone marks any
+  // issue resolved. Result: dashboard tile said 47, PDF said 45 — same scan.
+  //
+  // Fix: compute the tile counts from the same source and same filter the
+  // PDF uses. Guaranteed to match forever.
+  // -------------------------------------------------------------------------
+  const openIssues = useMemo(() => issues.filter((i: any) => !i.is_resolved), [issues]);
+  const openBySeverity = useMemo(() => {
+    const out: Record<string, number> = { critical: 0, serious: 0, moderate: 0, minor: 0 };
+    for (const i of openIssues) {
+      const sev = String(i.severity || "").toLowerCase();
+      if (out[sev] !== undefined) out[sev]++;
+    }
+    return out;
+  }, [openIssues]);
   const filteredIssuesTotal = issuesData?.data?.total ?? 0;
 
   const categoryBreakdown = useMemo(() => {
@@ -81,7 +101,9 @@ export default function SummaryTab({ scan }: { scan: any }) {
   const completed = scan.status === "completed";
 
   const statCards = [
-    { label: "Total Issues", value: filteredIssuesTotal, icon: AlertTriangle, color: "#ff9f43" },
+    // Uses openIssues.length so this tile reconciles with the PDF report,
+    // which also counts only unresolved issues.
+    { label: "Total Issues", value: openIssues.length, icon: AlertTriangle, color: "#ff9f43" },
     { label: "Accessibility Score", value: `${Math.round(score)}/100`, icon: TrendingUp, color: score >= 80 ? "#0f766e" : score >= 50 ? "#ffd60a" : "#ff4d6d" },
     { label: "URLs Scanned", value: (scan.urls || []).length, icon: Shield, color: "#0f766e" },
     { label: "Scan Duration",
@@ -150,7 +172,7 @@ export default function SummaryTab({ scan }: { scan: any }) {
                   <span className="text-slate-500">{s.label}</span>
                 </div>
                 <span className="font-semibold" style={{ color: s.color }}>
-                  {scan[s.scanKey] || 0}
+                  {openBySeverity[s.key] || 0}
                 </span>
               </div>
             ))}

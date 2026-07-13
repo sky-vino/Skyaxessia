@@ -166,7 +166,9 @@ fi
 # [6/7] Persistent data directory
 # ---------------------------------------------------------------------------
 mkdir -p /home/data
+mkdir -p /home/data/traces
 log "[6/7] Persistent data directory ready at /home/data."
+log "[6/7] Playwright trace output directory ready at /home/data/traces."
 
 # ---------------------------------------------------------------------------
 # [7/7] Launch backend under Xvfb virtual display

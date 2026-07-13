@@ -30,6 +30,15 @@ export interface ScanIssue {
   state?: string;
   phase?: string;
   affectedCount?: number;
+  /**
+   * Ship 2 / Item 5 — URL-independent grouping key for landmark-scoped issues
+   * (banner / contentinfo / navigation / main / complementary / region /
+   * search / form). Populated by scanner post-processing. The scan detail
+   * endpoint aggregates issues sharing this key across URLs so cross-page
+   * duplicates (e.g. a footer rule firing on all 30 crawled pages) show as
+   * one entry with a "Appears on N pages" badge.
+   */
+  landmark_group_key?: string;
 }
 
 export interface ElemPath {
@@ -154,6 +163,21 @@ export interface ScanOptions {
   run_motion?: boolean;
   run_reflow?: boolean;
   capture_screenshots?: boolean;
+  /**
+   * Ship 1 / Item 4 — WCAG zoom target.
+   * 400 (WCAG 1.4.10 default) tests both 200%/300% intermediate breakpoints AND the 320px reflow (400% equivalent).
+   * 200 skips the 320px reflow test and only reports 200% intermediate-breakpoint failures.
+   * Defaults to 200 to match this team's audit scenario.
+   */
+  zoom_target_percent?: 200 | 400;
+  /**
+   * Ship 1 / Item 7 — When true, advisory / best-practice rules
+   * (target-size-enhanced, fixed-font-size, text-truncation,
+   *  complex-background, motion, gesture-no-alternative) are dropped
+   * from scan output entirely instead of being downgraded to the
+   * "advisory" category. Defaults to false (preserves prior behaviour).
+   */
+  suppress_advisory_rules?: boolean;
   /** shallow = fast target-only checks; standard = sampled states; exhaustive = deeper state discovery. */
   scan_depth_mode?: "shallow" | "standard" | "exhaustive";
   viewport_width?: number;

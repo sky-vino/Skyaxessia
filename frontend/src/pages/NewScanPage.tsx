@@ -95,6 +95,13 @@ export default function NewScanPage() {
     run_zoom: true, run_color: true, run_pointer: true, run_live_dom: true,
     run_states: true, run_dynamic: true, run_motion: true, run_reflow: true,
     capture_screenshots: true,
+    // Ship 1 / Item 4 — default matches this team's audit scenario (200%).
+    // Users can flip to 400% (WCAG 1.4.10 default) in the UI below.
+    zoom_target_percent: 200 as 200 | 400,
+    // Ship 1 / Item 7 — default keeps advisory rules visible (as "advisory")
+    // so existing reports don't change silently. Users can flip on to remove
+    // font-size / pixel / motion / target-size-enhanced noise entirely.
+    suppress_advisory_rules: false,
     scan_depth_mode: "standard",
     scan_entry_mode: "url",
     crawl_mode: false,
@@ -564,6 +571,7 @@ export default function NewScanPage() {
 
         {/* Scan Options */}
         <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.08 }} className="card p-6">
+
           <h2 className="text-sm font-semibold text-slate-300 mb-4">Scan Modules</h2>
           <div className="mb-4 grid grid-cols-3 gap-2">
             {[
@@ -603,6 +611,43 @@ export default function NewScanPage() {
           </div>
           <div className="mt-3 pt-3 border-t" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
             <Toggle checked={opts.capture_screenshots} onChange={v => setOpts({ ...opts, capture_screenshots: v })} label="Capture screenshots" />
+          </div>
+
+          {/* Ship 1 / Item 4 — Zoom / reflow audit target */}
+          <div className="mt-3 pt-3 border-t" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
+            <label className="block text-xs text-slate-500 mb-1.5">Zoom / reflow audit target</label>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                { value: 200, label: "AA-lite (200% only)", description: "Matches this team's audit scenario. Skips 320px reflow." },
+                { value: 400, label: "WCAG AA (400%)", description: "Tests 200%/300% intermediate breakpoints AND 320px reflow (WCAG 1.4.10)." },
+              ].map(({ value, label, description }) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setOpts({ ...opts, zoom_target_percent: value as 200 | 400 })}
+                  className={`text-left rounded-xl px-3 py-2 border transition-all ${opts.zoom_target_percent === value ? "text-accent" : "text-slate-400 hover:text-slate-200"}`}
+                  style={{
+                    background: opts.zoom_target_percent === value ? "rgba(15,118,110,0.08)" : "rgba(255,255,255,0.025)",
+                    borderColor: opts.zoom_target_percent === value ? "rgba(15,118,110,0.45)" : "var(--border)"
+                  }}
+                >
+                  <div className="text-xs font-semibold">{label}</div>
+                  <div className="text-[10px] text-slate-600 mt-1">{description}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Ship 1 / Item 7 — advisory rule suppression */}
+          <div className="mt-3 pt-3 border-t" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
+            <Toggle
+              checked={opts.suppress_advisory_rules}
+              onChange={v => setOpts({ ...opts, suppress_advisory_rules: v })}
+              label="Suppress advisory / best-practice rules (font size, target-size-enhanced, motion, gestures)"
+            />
+            <div className="text-[10px] text-slate-600 mt-1 pl-1">
+              When on: drops <code>target-size-enhanced</code>, <code>fixed-font-size</code>, <code>text-truncation</code>, <code>complex-background</code>, <code>motion</code>, and <code>gesture-no-alternative</code> from the report entirely. When off: they are downgraded to the "advisory" category (default).
+            </div>
           </div>
           <div className="mt-4 pt-4 border-t space-y-3" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
             <Toggle checked={Boolean((opts as any).controlled_interaction_scan)} onChange={v => setOpts({ ...opts, controlled_interaction_scan: v })} label="Controlled interaction scan for links, buttons, popups, and in-page changes" />

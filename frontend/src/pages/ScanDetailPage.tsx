@@ -6,23 +6,25 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft, LayoutDashboard, AlertTriangle, Code2,
   FlaskConical, Eye, Loader2, RefreshCw,
-  Layers, FileText, RotateCcw, ListChecks, Trash2, X
+  Layers, FileText, RotateCcw, ListChecks, Trash2, X, Ear
 } from "lucide-react";
 
-import SummaryTab   from "../components/tabs/SummaryTab";
-import IssuesTab    from "../components/tabs/IssuesTab";
-import FixesTab     from "../components/tabs/FixesTab";
-import TestCasesTab from "../components/tabs/TestCasesTab";
-import LiveDomTab   from "../components/tabs/LiveDomTab";
-import StatesTab    from "../components/tabs/StatesTab";
+import SummaryTab      from "../components/tabs/SummaryTab";
+import IssuesTab       from "../components/tabs/IssuesTab";
+import FixesTab        from "../components/tabs/FixesTab";
+import TestCasesTab    from "../components/tabs/TestCasesTab";
+import LiveDomTab      from "../components/tabs/LiveDomTab";
+import StatesTab       from "../components/tabs/StatesTab";
+import ScreenReaderTab from "../components/tabs/ScreenReaderTab";
 
 const TABS = [
-  { id: "summary",   label: "Summary",     icon: LayoutDashboard },
-  { id: "issues",    label: "Issues",      icon: AlertTriangle },
-  { id: "fixes",     label: "AI Fixes",    icon: Code2 },
-  { id: "states",    label: "UI States",   icon: Layers },
-  { id: "testcases", label: "Test Cases",  icon: FlaskConical },
-  { id: "livedom",   label: "Live DOM",    icon: Eye },
+  { id: "summary",      label: "Summary",       icon: LayoutDashboard },
+  { id: "issues",       label: "Issues",        icon: AlertTriangle },
+  { id: "fixes",        label: "AI Fixes",      icon: Code2 },
+  { id: "screenreader", label: "Screen Reader", icon: Ear },
+  { id: "states",       label: "UI States",     icon: Layers },
+  { id: "testcases",    label: "Test Cases",    icon: FlaskConical },
+  { id: "livedom",      label: "Live DOM",      icon: Eye },
 ];
 
 const STATUS_COLORS: Record<string, string> = {
@@ -39,6 +41,7 @@ const REPORT_SECTION_OPTIONS = [
   { id: "interactions", label: "Controlled interactions" },
   { id: "testcases", label: "Test cases" },
   { id: "states", label: "UI states" },
+  { id: "screenreader", label: "Screen reader perspective" },
   { id: "issues", label: "Issues" },
 ];
 
@@ -194,6 +197,97 @@ export default function ScanDetailPage() {
         </html>
       `);
       win.document.close();
+    } finally {
+      setDownloading(null);
+      setReportMenuOpen(false);
+    }
+  };
+
+  // Save the interactive HTML report to a local file (no new window).
+  const handleDownloadReportHtml = async () => {
+    if (!id || downloading === "html") return;
+    const sections = reportSections.length ? reportSections : REPORT_SECTION_OPTIONS.map(option => option.id);
+    setDownloading("html");
+    try {
+      const { data: html } = await reportApi.getReport(id, sections);
+      const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = `${scan?.name || "accessibility-report"}.html`.replace(/[^\w.-]+/g, "-");
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+    } finally {
+      setDownloading(null);
+      setReportMenuOpen(false);
+    }
+  };
+
+  // Save the raw scan + issues as JSON — for CI pipelines, Jira import, etc.
+  // Download all Playwright auth trace .zip files for this scan.
+  // Files are the deep diagnostic capture around each Accedi / Conferma
+  // click — screenshots + DOM snapshots + network + console. Sky's ops team
+  // opens them at https://trace.playwright.dev to see exactly what our
+  // browser saw and sent during authentication.
+  const handleDownloadAuthTraces = async () => {
+    if (!id || downloading === "traces") return;
+    setDownloading("traces");
+    try {
+      const { data } = await scanApi.authTraces(id);
+      const traces: any[] = data?.traces || [];
+      if (traces.length === 0) {
+        alert("No auth trace files have been captured for this scan yet.\n\n" +
+              "Traces are produced only when a scan attempts an authenticated login. " +
+              "If this scan failed before login, or was unauthenticated, no traces exist.");
+        return;
+      }
+      for (const trace of traces) {
+        const { data: blob } = await scanApi.authTraceDownload(id, trace.filename);
+        const blobUrl = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = blobUrl;
+        link.download = trace.filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+        // Space out downloads so the browser doesn't reject rapid-fire prompts.
+        await new Promise(r => setTimeout(r, 400));
+      }
+    } catch (err: any) {
+      console.error("Auth trace download failed", err);
+      alert("Could not download auth traces. Check the browser console for details.");
+    } finally {
+      setDownloading(null);
+      setReportMenuOpen(false);
+    }
+  };
+
+  const handleDownloadReportJson = async () => {
+    if (!id || downloading === "json") return;
+    setDownloading("json");
+    try {
+      const [{ data: scanData }, { data: issuesData }] = await Promise.all([
+        scanApi.get(id),
+        issueApi.list({ scan_id: id, limit: 10000 })
+      ]);
+      const payload = {
+        scan: scanData?.scan || scanData,
+        issues: issuesData?.issues || issuesData,
+        exported_at: new Date().toISOString(),
+        exported_by: "axessia-web"
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = `${scan?.name || "accessibility-report"}.json`.replace(/[^\w.-]+/g, "-");
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
     } finally {
       setDownloading(null);
       setReportMenuOpen(false);
@@ -374,12 +468,32 @@ export default function ScanDetailPage() {
                     <button
                       type="button"
                       onClick={handleDownloadReport}
-                      disabled={downloading === "report" || !interactiveReportOpened}
+                      disabled={downloading === "report"}
                       className="w-full flex items-center justify-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all disabled:opacity-60"
                       style={{ borderColor: "rgba(15,118,110,0.35)", color: "#0f766e", background: "rgba(15,118,110,0.08)" }}
                     >
                       {downloading === "report" ? <Loader2 size={13} className="animate-spin" /> : <FileText size={13} />}
-                      {interactiveReportOpened ? "Download PDF report" : "Open interactive report first"}
+                      Download PDF report
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDownloadReportHtml}
+                      disabled={downloading === "html"}
+                      className="mt-2 w-full flex items-center justify-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all disabled:opacity-60"
+                      style={{ borderColor: "var(--border-strong)", color: "var(--text)" }}
+                    >
+                      {downloading === "html" ? <Loader2 size={13} className="animate-spin" /> : <FileText size={13} />}
+                      Download HTML report
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDownloadReportJson}
+                      disabled={downloading === "json"}
+                      className="mt-2 w-full flex items-center justify-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all disabled:opacity-60"
+                      style={{ borderColor: "var(--border-strong)", color: "var(--text)" }}
+                    >
+                      {downloading === "json" ? <Loader2 size={13} className="animate-spin" /> : <FileText size={13} />}
+                      Download JSON (raw data)
                     </button>
                     <button
                       type="button"
@@ -391,6 +505,35 @@ export default function ScanDetailPage() {
                       {downloading === "interactive" ? <Loader2 size={13} className="animate-spin" /> : <FileText size={13} />}
                       Open interactive report
                     </button>
+                    <div className="mt-3 pt-3 border-t" style={{ borderColor: "var(--border)" }}>
+                      <div className="text-[10px] uppercase tracking-wide mb-2" style={{ color: "var(--muted)" }}>
+                        Diagnostics
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleDownloadAuthTraces}
+                        disabled={downloading === "traces"}
+                        className="w-full flex items-center justify-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all disabled:opacity-60"
+                        style={{ borderColor: "var(--border-strong)", color: "var(--text)" }}
+                        title="Playwright trace files (.zip) captured around Accedi / Conferma clicks. Open at trace.playwright.dev to send to Sky."
+                      >
+                        {downloading === "traces" ? <Loader2 size={13} className="animate-spin" /> : <FileText size={13} />}
+                        Download auth traces (for Sky)
+                      </button>
+                      <div className="text-[10px] mt-1.5 leading-relaxed" style={{ color: "var(--muted)" }}>
+                        Playwright trace .zip files from each auth click.
+                        Open at{" "}
+                        <a
+                          href="https://trace.playwright.dev"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          style={{ color: "#0f766e", textDecoration: "underline" }}
+                        >
+                          trace.playwright.dev
+                        </a>{" "}
+                        (drag & drop, no install).
+                      </div>
+                    </div>
                   </div>
                 )}
               </div>
@@ -512,12 +655,13 @@ export default function ScanDetailPage() {
             exit={{ opacity: 0, y: -6 }}
             transition={{ duration: 0.2 }}
             className="h-full">
-            {activeTab === "summary"   && <SummaryTab   scan={scan} />}
-            {activeTab === "issues"    && <IssuesTab    scanId={scan.id} focusedIssueId={focusedIssueId} onOpenAiFix={(issueId) => { setFocusedIssueId(null); setFocusedFixIssueId(issueId); setActiveTab("fixes"); }} onOpenState={(issue) => { setFocusedIssueId(null); setFocusedStateIssueId(issue.id); setFocusedStateName(issue.state_label || issue.state || issue.phase || "default"); setActiveTab("states"); }} />}
-            {activeTab === "fixes"     && <FixesTab     scanId={scan.id} focusedIssueId={focusedFixIssueId} onBackToIssue={(issueId) => { setFocusedFixIssueId(null); setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
-            {activeTab === "states"    && <StatesTab    scanId={scan.id} focusedIssueId={focusedStateIssueId} preferredState={focusedStateName} onBackToIssue={(issueId) => { setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
-            {activeTab === "testcases" && <TestCasesTab scanId={scan.id} />}
-            {activeTab === "livedom"   && <LiveDomTab   scanId={scan.id} />}
+            {activeTab === "summary"      && <SummaryTab      scan={scan} />}
+            {activeTab === "issues"       && <IssuesTab       scanId={scan.id} focusedIssueId={focusedIssueId} onOpenAiFix={(issueId) => { setFocusedIssueId(null); setFocusedFixIssueId(issueId); setActiveTab("fixes"); }} onOpenState={(issue) => { setFocusedIssueId(null); setFocusedStateIssueId(issue.id); setFocusedStateName(issue.state_label || issue.state || issue.phase || "default"); setActiveTab("states"); }} />}
+            {activeTab === "fixes"        && <FixesTab        scanId={scan.id} focusedIssueId={focusedFixIssueId} onBackToIssue={(issueId) => { setFocusedFixIssueId(null); setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
+            {activeTab === "screenreader" && <ScreenReaderTab scanId={scan.id} />}
+            {activeTab === "states"       && <StatesTab       scanId={scan.id} focusedIssueId={focusedStateIssueId} preferredState={focusedStateName} onBackToIssue={(issueId) => { setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
+            {activeTab === "testcases"    && <TestCasesTab    scanId={scan.id} />}
+            {activeTab === "livedom"      && <LiveDomTab      scanId={scan.id} />}
 
           </motion.div>
         </AnimatePresence>

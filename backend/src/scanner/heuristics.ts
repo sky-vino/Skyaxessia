@@ -84,9 +84,17 @@ export async function runHeuristics(
       });
     return out.slice(0, 100);
   });
-  issues.push(...pack(targetSize, "heuristic:target-size", "serious", 2, "pointer",
-    `${targetSize.length} interactive elements are smaller than 24×24 CSS pixels.`,
-    ["wcag2.5.8"], "Set min-width/min-height: 24px or increase padding on interactive elements.", url, state, phase));
+  // Tier 1 fix — surface the cap in the message. Same pattern applies to
+  // most other checks in this file that end in `.slice(0, N)`; the counts
+  // shown to users would otherwise silently truncate.
+  {
+    const cap = 100;
+    const capped = targetSize.length >= cap;
+    const msg = `${targetSize.length}${capped ? "+ (list capped)" : ""} interactive element(s) are smaller than 24×24 CSS pixels.`;
+    issues.push(...pack(targetSize, "heuristic:target-size", "serious", 2, "pointer",
+      msg,
+      ["wcag2.5.8"], "Set min-width/min-height: 24px or increase padding on interactive elements.", url, state, phase));
+  }
 
   // ── 2. Text truncation ────────────────────────────────────────────────────
   const truncation = await safeEval<ElemData[]>(page, () => {
@@ -294,29 +302,59 @@ export async function runHeuristics(
   }
 
   // ── 12. Reduced motion ────────────────────────────────────────────────────
+  // Tier 1 fixes:
+  //  (a) The previous check treated any element with transition-duration > 0
+  //      as "animated". Hover transitions like `transition: color 0.2s ease`
+  //      on links and buttons trigger this on every modern site. Reduced-motion
+  //      typically targets larger movements (spinners, parallax, autoplay
+  //      slideshows) — CSS animations, not hover transitions. Only count
+  //      elements with a non-"none" `animationName`.
+  //  (b) `s.cssRules` throws for cross-origin stylesheets (CORS-protected).
+  //      The previous version silently returned false for those sheets — so a
+  //      prefers-reduced-motion media query in a CDN-hosted stylesheet was
+  //      invisible and the page was false-flagged. Now we count how many
+  //      stylesheets we could NOT inspect and disclose that in the message.
   const hasAnimation = await safeEval<boolean>(page, () => {
     let found = false;
     document.querySelectorAll("*").forEach((el: any) => {
       const st = getComputedStyle(el);
-      if ((st.animationName && st.animationName !== "none") || (st.transitionDuration && st.transitionDuration !== "0s")) {
+      if (st.animationName && st.animationName !== "none") {
         found = true;
       }
     });
     return found;
   });
-  const hasMotionQuery = await safeEval<boolean>(page, () => {
+  const motionInspection = await safeEval<{ found: boolean; crossOrigin: number; totalSheets: number }>(page, () => {
     const sheets = Array.from(document.styleSheets);
-    return sheets.some(s => {
+    let crossOrigin = 0;
+    let found = false;
+    for (const s of sheets) {
       try {
-        return Array.from(s.cssRules).some(r => r.cssText.includes("prefers-reduced-motion"));
-      } catch { return false; }
-    });
+        const rules = Array.from(s.cssRules || []);
+        if (rules.some((r: any) => r.cssText && r.cssText.includes("prefers-reduced-motion"))) {
+          found = true;
+          break;
+        }
+      } catch {
+        crossOrigin++;
+      }
+    }
+    return { found, crossOrigin, totalSheets: sheets.length };
   });
-  if (hasAnimation && !hasMotionQuery) {
-    issues.push({ ruleId: "heuristic:reduced-motion", severity: "serious", priority: 2, category: "motion",
-      message: "Animated elements detected but no @media (prefers-reduced-motion) query found.",
+  if (hasAnimation && !motionInspection.found) {
+    const crossOriginNote = motionInspection.crossOrigin > 0
+      ? ` Note: ${motionInspection.crossOrigin} of ${motionInspection.totalSheets} stylesheet(s) are cross-origin and could not be inspected from the page; a prefers-reduced-motion media query in those sheets would not be detected here — verify with a manual view-source check if this rule surprises you.`
+      : "";
+    issues.push({
+      ruleId: "heuristic:reduced-motion",
+      severity: "moderate",
+      priority: 3,
+      category: "motion",
+      message: `CSS animation detected on one or more elements, but no @media (prefers-reduced-motion) query was found in any inspectable stylesheet.${crossOriginNote}`,
       url, selector: "body", selectors: ["body"], depths: [0], wcag: ["wcag2.3.3"],
-      fixSuggestion: "Wrap all animations in @media (prefers-reduced-motion: no-preference) { } so users who opt-out see no motion.", state, phase });
+      fixSuggestion: "Wrap all animations in @media (prefers-reduced-motion: no-preference) { } (or use `reduce` to remove them) so users who opt-out see no motion.",
+      state, phase,
+    });
   }
 
   return issues.filter(i => i.selectors?.length || i.selector);
