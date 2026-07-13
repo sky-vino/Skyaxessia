@@ -28,11 +28,9 @@ const app = express();
 const httpServer = createServer(app);
 
 // ─── CORS ───────────────────────────────────────────────────────────────────
-// When the SPA is served from the same origin (Azure single-container), the
-// browser does not send an Origin header for same-origin requests, so this
-// is essentially permissive by design. Set AXESSIA_ALLOWED_ORIGINS to a
-// comma-separated allow-list to lock it down, or FRONTEND_URL for a single
-// origin. Bearer-token auth is still required on every protected endpoint.
+// Accepts * (allow all), a single origin, or a comma-separated list.
+// Set AXESSIA_ALLOWED_ORIGINS or FRONTEND_URL in Azure App Settings.
+// Defaults to * so a fresh deploy works without any extra config.
 const allowedOrigins = (
   process.env.AXESSIA_ALLOWED_ORIGINS ||
   process.env.FRONTEND_URL ||
@@ -52,6 +50,7 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(
   cors({
     origin: (origin, callback) => {
+      // No origin = same-origin request (server-to-server, curl, health checks)
       if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
         callback(null, true);
         return;
@@ -83,18 +82,12 @@ app.get("/api/health", (_req, res) => {
     name: "Axessia",
     version: "1.0.0",
     environment: process.env.NODE_ENV || "development",
-    queue:
-      process.env.REDIS_URL && process.env.SCAN_QUEUE_DRIVER !== "memory"
-        ? "redis"
-        : "memory",
-    ai_provider: "azure-openai",
     timestamp: new Date().toISOString()
   });
 });
 
 // ─── Static frontend (single-container deploy) ──────────────────────────────
-// The React SPA is served from the same Node process. Default location is
-// /home/site/wwwroot/frontend/dist. Override with STATIC_DIR if needed.
+// Serves the React SPA from the same Node process.
 const staticDir =
   process.env.STATIC_DIR ||
   path.resolve(__dirname, "..", "..", "frontend", "dist");
@@ -104,7 +97,7 @@ const indexHtmlPath = path.join(staticDir, "index.html");
 if (fs.existsSync(indexHtmlPath)) {
   logger.info(`Serving frontend from ${staticDir}`);
 
-  // Long cache on immutable hashed assets, no cache on the entry point.
+  // Long cache on immutable hashed assets, no cache on the HTML entry point.
   app.use(
     "/assets",
     express.static(path.join(staticDir, "assets"), {
@@ -124,8 +117,7 @@ if (fs.existsSync(indexHtmlPath)) {
     })
   );
 
-  // SPA fallback: any non-/api, non-/ws path returns index.html so React
-  // Router can handle deep-link routes like /scans/<id>.
+  // SPA fallback: any non-/api, non-/ws path returns index.html
   app.get(/^(?!\/api\/|\/ws).*/, (_req, res) => {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.sendFile(indexHtmlPath);
@@ -134,7 +126,7 @@ if (fs.existsSync(indexHtmlPath)) {
   logger.warn(`Static frontend not mounted: ${indexHtmlPath} does not exist`);
 }
 
-// ─── Error handler (must be after routes) ───────────────────────────────────
+// ─── Error handler ───────────────────────────────────────────────────────────
 app.use(errorHandler);
 
 // ─── Start ──────────────────────────────────────────────────────────────────
