@@ -38,7 +38,7 @@ jobs:
         working-directory: backend
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-browsers
-        run: npx playwright install chromium
+        run: node node_modules/playwright/cli.js install chromium
 
       - name: Compile backend TypeScript
         working-directory: backend
