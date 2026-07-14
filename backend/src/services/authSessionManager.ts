@@ -6,33 +6,9 @@
  * read automatically. Between "Generate OTP" and "Login and Scan", the browser
  * stays alive in memory holding the security-page state.
  *
- * Architectural contract:
- *   - startSession(url, username, password, options) → sessionId
- *       Launches Playwright, fills creds, clicks Accedi, waits for security
- *       page, clicks "Send by email" (or SMS depending on options), returns
- *       control to the caller with the browser paused on the OTP screen.
- *
- *   - getSession(sessionId) → status snapshot for polling
- *       Includes phase (awaiting_otp | submitting_otp | authenticated | failed
- *       | expired), any error message, and the destination URL.
- *
- *   - submitOtp(sessionId, otp) → { scanId }
- *       Types OTP, clicks Conferma, waits for authenticated landing,
- *       extracts cookies + storageState, closes the interactive browser,
- *       spawns a normal scan pre-loaded with the authenticated cookies.
- *
- *   - cancelSession(sessionId)
- *       User cancelled; force-close browser and mark expired.
- *
- * Session lifetime:
- *   Default TTL is 5 minutes. A background cleanup interval kills any session
- *   past its expiresAt. Handles the "user closed the browser tab and walked
- *   away" case without leaking Playwright processes.
- *
- * Concurrency:
- *   Each session holds ~200MB RAM (a Chromium process). Cap at MAX_CONCURRENT
- *   sessions per Node process. Additional startSession calls throw with a
- *   clear "capacity exceeded, try again in a moment" message.
+ * Azure-hardened build: extensive logging + retry + real mouse events for
+ * clickDeliveryChannel so channel-switch works under xvfb where synthetic
+ * element.click() from page.evaluate() sometimes doesn't fire Sky's handlers.
  */
 
 import { chromium, Browser, BrowserContext, Page } from "playwright";
@@ -48,14 +24,14 @@ import { scanQueue } from "./scanQueue";
 // -----------------------------------------------------------------------------
 
 export type AuthSessionPhase =
-  | "launching"          // Playwright starting up
-  | "filling_credentials"// Filling username/password
-  | "requesting_otp"     // Clicked Accedi, waiting for security page
-  | "awaiting_otp"       // OTP screen visible, waiting for user to enter code
-  | "submitting_otp"     // OTP received, submitting to Sky
-  | "authenticated"      // Login complete, scan queued/started
-  | "failed"             // Something broke - see errorMessage
-  | "expired";           // TTL exceeded
+  | "launching"
+  | "filling_credentials"
+  | "requesting_otp"
+  | "awaiting_otp"
+  | "submitting_otp"
+  | "authenticated"
+  | "failed"
+  | "expired";
 
 export type OtpChannel = "email" | "sms";
 
@@ -92,14 +68,20 @@ const MAX_CONCURRENT = Number(process.env.AUTH_SESSION_MAX_CONCURRENT || 3);
 const SESSION_TTL_MS = Number(process.env.AUTH_SESSION_TTL_MS || 5 * 60 * 1000);
 const REAP_INTERVAL_MS = 30 * 1000;
 
-// Default selectors matching Sky iD's flow. Override via authConfig.
-// These are FALLBACKS - the primary path is auto-detection via findLoginForm.
-const DEFAULT_SELECTORS = {
-  otp_input_selector: "input.sky-otp-input, input[maxlength='1'][type='tel'], input[maxlength='1'][type='text']",
-  otp_submit_selector: "button.sky-otp-confirm, button:has-text('He confirms'), button:has-text('Conferma')",
-  email_delivery_selector: "a:has-text('Send by email'), a:has-text('Invia tramite email'), button:has-text('Send by email')",
-  sms_delivery_selector: "a:has-text('Send via SMS'), a:has-text('Invia di nuovo via SMS'), button:has-text('Send via SMS')",
-};
+// Azure is materially slower than a dev laptop. These knobs let us dial the
+// timing without recompiling every time we discover a new slow-boot edge case.
+const AZURE_MODE = process.env.WEBSITE_INSTANCE_ID !== undefined
+  || process.env.WEBSITE_SITE_NAME !== undefined
+  || process.env.AZURE_HARDEN === "1";
+const SECURITY_PAGE_TIMEOUT_MS = AZURE_MODE ? 45000 : 30000;
+const HYDRATION_WAIT_MS = AZURE_MODE ? 5000 : 1500;
+const CHANNEL_SWITCH_ATTEMPTS = 3;
+
+logger.info(`[auth-session] Module init: AZURE_MODE=${AZURE_MODE}, `
+  + `security_page_timeout=${SECURITY_PAGE_TIMEOUT_MS}ms, `
+  + `hydration_wait=${HYDRATION_WAIT_MS}ms, `
+  + `max_concurrent=${MAX_CONCURRENT}, `
+  + `session_ttl=${SESSION_TTL_MS}ms`);
 
 // -----------------------------------------------------------------------------
 // Internal registry
@@ -117,12 +99,10 @@ interface LiveSession {
   scanId?: string;
   errorMessage?: string;
 
-  // Live handles - never serialised, never returned to the client.
   browser?: Browser;
   context?: BrowserContext;
   page?: Page;
 
-  // Pending scan config to hand off after successful OTP.
   pendingScan?: {
     scanName?: string;
     scanOptions: any;
@@ -162,10 +142,8 @@ export async function startSession(input: StartSessionInput): Promise<AuthSessio
   };
   sessions.set(id, session);
 
-  logger.info(`[auth-session ${id}] Launching for ${input.targetUrl}, channel=${otpChannel}`);
+  logger.info(`[auth-session ${id}] START — targetUrl=${input.targetUrl}, channel=${otpChannel}, user=${input.username?.slice(0, 3)}***`);
 
-  // Do the launch + credential fill + delivery-channel click in the background.
-  // Return immediately with { phase: "launching" } so the UI can start polling.
   void driveToOtpScreen(session, input).catch(err => {
     logger.error(`[auth-session ${id}] driveToOtpScreen failed:`, err);
     session.phase = "failed";
@@ -202,7 +180,6 @@ export async function submitOtp(id: string, otp: string): Promise<AuthSessionSna
     await clickConferma(session.page);
     await waitForAuthenticatedLanding(session.page, session.targetUrl);
 
-    // Extract cookies from the authenticated context.
     const cookies = await session.context.cookies();
     logger.info(`[auth-session ${id}] Auth succeeded, ${cookies.length} cookies extracted`);
 
@@ -210,7 +187,6 @@ export async function submitOtp(id: string, otp: string): Promise<AuthSessionSna
       throw new Error("Session has no pending scan config to hand off to the scanner.");
     }
 
-    // Create a scan record with the cookies pre-injected into scan_options.
     const scanOptions = {
       ...(session.pendingScan.scanOptions || {}),
       extension_session_cookies: cookies.map(c => ({
@@ -234,7 +210,7 @@ export async function submitOtp(id: string, otp: string): Promise<AuthSessionSna
         session.pendingScan.projectId || null,
         session.pendingScan.createdBy,
         session.pendingScan.stateLabel,
-        null,  // authConfig intentionally NULL — cookies already inject in createBrowserContext
+        null,
         JSON.stringify(scanOptions),
       ]
     );
@@ -245,11 +221,7 @@ export async function submitOtp(id: string, otp: string): Promise<AuthSessionSna
     await scanQueue.add(scan.id);
     logger.info(`[auth-session ${id}] Scan ${scan.id} queued`);
 
-    // Close the interactive browser - the scan launches its own.
     await cleanupBrowser(session);
-
-    // Keep the session in the registry for a few minutes so the UI's final
-    // poll still resolves to phase="authenticated" with the scan_id.
     setTimeout(() => sessions.delete(id), 60 * 1000);
 
     return toSnapshot(session);
@@ -280,41 +252,60 @@ export function listActiveSessions(): AuthSessionSnapshot[] {
 // -----------------------------------------------------------------------------
 
 async function driveToOtpScreen(session: LiveSession, input: StartSessionInput): Promise<void> {
+  const sid = session.id;
+  const t0 = Date.now();
+  const step = (name: string) => logger.info(`[auth-session ${sid}] STEP ${name} (t+${Date.now() - t0}ms)`);
+
+  step("launching Chromium");
   session.phase = "launching";
   const browser = await launchStealthChromium();
   session.browser = browser;
+  step("Chromium launched");
+
   const context = await createStealthContext(browser);
   session.context = context;
   const page = await context.newPage();
   session.page = page;
+  step("context + page ready");
+
+  // Hook page-level events so we can see what Sky is throwing at us.
+  page.on("console", msg => {
+    if (msg.type() === "error" || msg.type() === "warning") {
+      logger.info(`[auth-session ${sid}] browser console [${msg.type()}]: ${msg.text().slice(0, 200)}`);
+    }
+  });
+  page.on("pageerror", err => {
+    logger.warn(`[auth-session ${sid}] browser pageerror: ${err?.message?.slice(0, 200)}`);
+  });
+  page.on("framenavigated", frame => {
+    if (frame === page.mainFrame()) {
+      logger.info(`[auth-session ${sid}] main frame navigated → ${frame.url()}`);
+    }
+  });
 
   session.phase = "filling_credentials";
-  logger.info(`[auth-session ${session.id}] Navigating to ${input.targetUrl}`);
+  step(`navigating to ${input.targetUrl}`);
   try {
     await page.goto(input.targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
   } catch (err: any) {
-    await saveDiagnosticSnapshot(page, session.id, "nav-failed").catch(() => undefined);
+    await saveDiagnosticSnapshot(page, sid, "nav-failed").catch(() => undefined);
     throw new Error(`Navigation to ${input.targetUrl} failed: ${err?.message || err}`);
   }
+  step(`nav complete, current URL=${page.url()}`);
 
-  // Wait for the network to quiet down. SPAs and OAuth redirects need this.
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => undefined);
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(HYDRATION_WAIT_MS);
+  step("post-nav settle done");
 
-  logger.info(`[auth-session ${session.id}] Attempting to dismiss cookie consent...`);
+  step("dismissing cookie consent");
   await dismissCookieConsent(page);
-  // Give the page 1s to settle after the modal is gone, so the login form
-  // can finish rendering / becoming interactive.
   await page.waitForTimeout(1000);
-  logger.info(`[auth-session ${session.id}] Cookie consent phase done. Current URL: ${page.url()}`);
+  step(`cookie phase done, URL=${page.url()}`);
 
-  // Auto-detect the login form. Works with either shadow-DOM custom elements
-  // (Sky test env) or plain HTML inputs (Sky production, and every other
-  // login form on the internet). No hardcoded selectors.
-  logger.info(`[auth-session ${session.id}] Auto-detecting login form...`);
+  step("auto-detecting login form");
   const form = await findLoginForm(page).catch(() => null);
   if (!form || !form.usernameFound || !form.passwordFound) {
-    const snap = await saveDiagnosticSnapshot(page, session.id, "no-login-form").catch(() => undefined);
+    const snap = await saveDiagnosticSnapshot(page, sid, "no-login-form").catch(() => undefined);
     throw new Error(
       `Could not find a login form on ${page.url()}. ` +
       `Detected: username=${form?.usernameFound ? "yes" : "no"}, password=${form?.passwordFound ? "yes" : "no"}, submit=${form?.submitFound ? "yes" : "no"}. ` +
@@ -322,50 +313,53 @@ async function driveToOtpScreen(session: LiveSession, input: StartSessionInput):
       (snap ? `. Screenshot saved: ${snap}` : "")
     );
   }
-  logger.info(`[auth-session ${session.id}] Form detected: ${form.description}`);
+  step(`form detected: ${form.description}`);
 
-  logger.info(`[auth-session ${session.id}] Filling username`);
+  step("filling username");
   const filledUser = await fillDetectedField(page, "username", input.username);
   if (!filledUser) {
-    await saveDiagnosticSnapshot(page, session.id, "user-fill-failed").catch(() => undefined);
+    await saveDiagnosticSnapshot(page, sid, "user-fill-failed").catch(() => undefined);
     throw new Error(`Found a username field but could not fill it. See screenshot on disk.`);
   }
 
-  logger.info(`[auth-session ${session.id}] Filling password`);
+  step("filling password");
   const filledPass = await fillDetectedField(page, "password", input.password);
   if (!filledPass) {
-    await saveDiagnosticSnapshot(page, session.id, "pass-fill-failed").catch(() => undefined);
+    await saveDiagnosticSnapshot(page, sid, "pass-fill-failed").catch(() => undefined);
     throw new Error(`Found a password field but could not fill it. See screenshot on disk.`);
   }
 
   session.phase = "requesting_otp";
-  logger.info(`[auth-session ${session.id}] Clicking submit button`);
+  step("clicking submit");
   const submitted = await clickDetectedSubmit(page);
   if (!submitted) {
-    logger.info(`[auth-session ${session.id}] No submit button found; pressing Enter as fallback`);
+    logger.info(`[auth-session ${sid}] no submit button found; pressing Enter as fallback`);
     await page.keyboard.press("Enter").catch(() => undefined);
   }
 
-  // Wait for the security/OTP page to appear.
+  step(`waiting for security/OTP page (timeout=${SECURITY_PAGE_TIMEOUT_MS}ms)`);
   try {
-    await waitForSecurityPage(page, 30000);
+    await waitForSecurityPage(page, SECURITY_PAGE_TIMEOUT_MS, sid);
   } catch (err: any) {
-    const snap = await saveDiagnosticSnapshot(page, session.id, "no-otp-page").catch(() => undefined);
+    const snap = await saveDiagnosticSnapshot(page, sid, "no-otp-page").catch(() => undefined);
     throw new Error(`${err?.message || err}${snap ? ` Screenshot saved: ${snap}` : ""}`);
   }
+  step(`security page reached, URL=${page.url()}`);
 
-  // Click "Send by email" (or SMS) if channel is set.
-  if (session.otpChannel === "email") {
-    logger.info(`[auth-session ${session.id}] Clicking "Send by email"`);
-    await clickDeliveryChannel(page, "email");
-  } else if (session.otpChannel === "sms") {
-    logger.info(`[auth-session ${session.id}] Clicking "Send via SMS"`);
-    await clickDeliveryChannel(page, "sms");
+  step(`switching delivery channel → ${session.otpChannel}`);
+  try {
+    await clickDeliveryChannel(page, session.otpChannel, sid);
+    step(`channel switch to ${session.otpChannel} succeeded`);
+  } catch (err: any) {
+    // Save a diagnostic snapshot for later inspection.
+    await saveDiagnosticSnapshot(page, sid, `channel-switch-failed-${session.otpChannel}`).catch(() => undefined);
+    // The channel switch is critical: if it fails we don't know which
+    // channel Sky used, and we don't want axessia UI lying to the user.
+    throw err;
   }
 
-  // Extract the masked recipient shown on the page for UI display.
   session.otpMaskedRecipient = await extractMaskedRecipient(page).catch(() => undefined);
-  logger.info(`[auth-session ${session.id}] OTP sent to: ${session.otpMaskedRecipient || "<unknown recipient>"}`);
+  logger.info(`[auth-session ${sid}] OTP sent to: ${session.otpMaskedRecipient || "<unknown recipient>"}`);
 
   session.pendingScan = {
     scanName: input.scanName,
@@ -377,22 +371,12 @@ async function driveToOtpScreen(session: LiveSession, input: StartSessionInput):
     stateLabel: "prod-auth-manual-otp",
   };
   session.phase = "awaiting_otp";
-  logger.info(`[auth-session ${session.id}] Ready — waiting for user to enter OTP`);
+  logger.info(`[auth-session ${sid}] READY (t+${Date.now() - t0}ms) — waiting for user to enter OTP`);
 }
 
 // -----------------------------------------------------------------------------
 // Auto-detecting login form finder + filler
 // -----------------------------------------------------------------------------
-//
-// Modern login pages fall into two families:
-//   Family A: plain HTML — <input type="email"> + <input type="password">
-//             + <button type="submit"> in a <form>.
-//   Family B: shadow-DOM custom elements — <sky-login-component>#shadow →
-//             <login-input>#shadow → <input>. Requires recursive descent.
-//
-// This finder handles both. It's called once at the start; the result gets
-// cached on `page` via a data-attribute so the subsequent fill/click calls
-// use the same discovered nodes.
 
 interface DetectedForm {
   usernameFound: boolean;
@@ -402,14 +386,11 @@ interface DetectedForm {
 }
 
 async function findLoginForm(page: Page): Promise<DetectedForm> {
-  // Give the page up to 10s for the login form to become visible. Shadow-DOM
-  // components can mount asynchronously.
   const timeoutMs = 10000;
   const startedAt = Date.now();
   let last: DetectedForm | null = null;
   while (Date.now() - startedAt < timeoutMs) {
     last = await page.evaluate(() => {
-      // Recursively walk the DOM including shadow roots.
       function walkAll(root: Document | ShadowRoot, out: Element[]) {
         const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
         let n: Node | null = walker.currentNode;
@@ -432,12 +413,7 @@ async function findLoginForm(page: Page): Promise<DetectedForm> {
       };
 
       const inputs = all.filter(el => el.tagName === "INPUT" && isVisible(el)) as HTMLInputElement[];
-
-      // Password: <input type="password">
       const password = inputs.find(el => el.type === "password") || null;
-
-      // Username: prefer type=email, then autocomplete hints, then text/tel/nothing,
-      // BUT positioned before the password field.
       const passwordIndex = password ? inputs.indexOf(password) : -1;
       const before = passwordIndex >= 0 ? inputs.slice(0, passwordIndex) : inputs;
       const scoreUsername = (el: HTMLInputElement) => {
@@ -456,7 +432,6 @@ async function findLoginForm(page: Page): Promise<DetectedForm> {
       };
       const username = before.slice().sort((a, b) => scoreUsername(b) - scoreUsername(a))[0] || null;
 
-      // Submit: <button type="submit">, then any button whose text looks like login.
       const buttons = all.filter(el =>
         (el.tagName === "BUTTON" || (el.tagName === "INPUT" && ["submit", "button"].includes((el as HTMLInputElement).type))) &&
         isVisible(el)
@@ -466,7 +441,6 @@ async function findLoginForm(page: Page): Promise<DetectedForm> {
         buttons.find(b => /accedi|sign\s?in|log\s?in|entra|conferma/i.test((b.innerText || (b as HTMLInputElement).value || "").trim())) ||
         buttons[0] || null;
 
-      // Mark for later retrieval - we can't return DOM refs from page.evaluate.
       if (username) (username as any).dataset.axessiaRole = "username";
       if (password) (password as any).dataset.axessiaRole = "password";
       if (submit) (submit as any).dataset.axessiaRole = "submit";
@@ -492,7 +466,6 @@ async function findLoginForm(page: Page): Promise<DetectedForm> {
 }
 
 async function fillDetectedField(page: Page, role: "username" | "password", value: string): Promise<boolean> {
-  // Uses the data-axessia-role attribute set by findLoginForm.
   return await page.evaluate(({ role, value }) => {
     function walkAll(root: Document | ShadowRoot, out: Element[]) {
       const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
@@ -562,7 +535,6 @@ async function saveDiagnosticSnapshot(page: Page, sessionId: string, label: stri
     logger.info(`[auth-session ${sessionId}] Diagnostic snapshot: ${p}`);
     logger.info(`[auth-session ${sessionId}]   URL:   ${url}`);
     logger.info(`[auth-session ${sessionId}]   Title: ${title}`);
-    // Also log a summary of visible inputs so we can see what selectors would work
     const inputs = await page.evaluate(() => {
       const out: any[] = [];
       document.querySelectorAll("input").forEach(el => {
@@ -632,75 +604,52 @@ function resolveFullChromiumPath(): string | undefined {
 }
 
 async function dismissCookieConsent(page: Page): Promise<void> {
-  // European cookie consent modals are loaded either inline OR inside an
-  // iframe (OneTrust, Didomi, TrustArc, IAB TCF). We search every frame,
-  // try every common variant of the accept button, then verify the modal
-  // is actually gone before returning.
-  //
-  // Ship 2g fix — Sky's own consent modal uses `#notice button.accbtn` with
-  // aria-label="Accetta tutto". Previous selector list missed the class-
-  // scoped selector, and the "still-present" verification looked for
-  // container names that DIDN'T include "notice" or "accbtn" so a successful
-  // click was sometimes reported as failed. Both fixed.
   const acceptSelectors = [
-    // Sky-specific — the exact button on sky.it uses class .accbtn inside #notice
     "#notice button.accbtn[aria-label='Accetta tutto']",
     "#notice button.accbtn",
     "button.accbtn[aria-label='Accetta tutto']",
     "button.accbtn",
     "[aria-label='Accetta tutto']",
     "[aria-label='Accetta tutti']",
-    // Sky-specific and common Italian variants
     "button:has-text('Accetta tutto')",
     "button:has-text('Accetta tutti')",
     "button:has-text('Accetta e chiudi')",
     "button:has-text('Accetto')",
     "button:has-text('OK, accetto')",
     "button:has-text('Ho capito')",
-    // English variants
     "button:has-text('Accept All')",
     "button:has-text('Accept all')",
     "button:has-text('I accept')",
     "button:has-text('Allow all')",
     "button:has-text('Agree and close')",
-    // Common CMP identifiers
     "button#onetrust-accept-btn-handler",
     "button#didomi-notice-agree-button",
     "button.qc-cmp2-accept-all",
     "[aria-label*='Accetta tutto' i]",
     "[aria-label*='Accept all' i]",
-    // Fallbacks - anything ROLE=button with accept-y text
     "[role='button']:has-text('Accetta tutto')",
     "[role='button']:has-text('Accept all')",
-    // Anchor-styled buttons (some CMPs use <a>)
     "a:has-text('Accetta tutto')",
     "a:has-text('Accept all')",
   ];
 
   const frames = page.frames();
+  logger.info(`[auth-session] cookie: scanning ${frames.length} frame(s) with ${acceptSelectors.length} selectors`);
   for (const frame of frames) {
     for (const sel of acceptSelectors) {
       try {
         const btn = frame.locator(sel).first();
         const count = await btn.count().catch(() => 0);
         if (count === 0) continue;
-        // Ship 2g fix — increased from 200ms to 1000ms. Cookie modals often
-        // animate in from off-screen and aren't hit-testable for the first
-        // ~600ms even though they're technically in the DOM.
         const visible = await btn.isVisible({ timeout: 1000 }).catch(() => false);
         if (!visible) continue;
-        logger.info(`[auth-session] Cookie banner: found "${sel}", clicking`);
+        logger.info(`[auth-session] cookie: found "${sel}", clicking`);
         await btn.click({ timeout: 2000, force: false }).catch(async () => {
-          // If a normal click intercepts, try force-click.
           await btn.click({ timeout: 2000, force: true }).catch(() => undefined);
         });
         await page.waitForTimeout(700);
-        // Best-effort verification: the modal should now be gone. If it's not,
-        // try the next selector. Look for common consent-modal container hints.
         const stillPresent = await page.evaluate(() => {
           const overlays = Array.from(document.querySelectorAll(
-            // Ship 2g fix — Sky's modal uses `#notice`, not a *consent*/*cookie* class.
-            // Added those + a few other real-world CMP wrappers.
             "#notice, [id='notice'], .accbtn," +
             "[id*='consent'], [class*='consent'], [id*='cookie'], [class*='cookie']," +
             "[id*='onetrust'], [id*='didomi'], [class*='cmp']," +
@@ -716,18 +665,14 @@ async function dismissCookieConsent(page: Page): Promise<void> {
           return false;
         }).catch(() => false);
         if (!stillPresent) {
-          logger.info(`[auth-session] Cookie banner dismissed via "${sel}"`);
-          return;  // Success
+          logger.info(`[auth-session] cookie: dismissed via "${sel}"`);
+          return;
         }
       } catch { /* try next */ }
     }
   }
 
-  // Ship 2g fix — final fallback: walk the ENTIRE DOM (including shadow roots)
-  // looking for any clickable element whose visible text is /accetta.*tutto/i
-  // or /accept.*all/i. This catches consent buttons wrapped in custom
-  // elements or nested in unusual structures that Playwright selectors miss.
-  logger.info("[auth-session] Cookie banner: no selector matched, trying DOM walker fallback");
+  logger.info("[auth-session] cookie: no selector matched, trying DOM walker fallback");
   const walkerClicked = await page.evaluate(() => {
     function walkAll(root: Document | ShadowRoot, out: Element[]) {
       const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
@@ -743,15 +688,12 @@ async function dismissCookieConsent(page: Page): Promise<void> {
     }
     const all: Element[] = [];
     walkAll(document, all);
-
     const isVisible = (el: Element) => {
       const r = (el as HTMLElement).getBoundingClientRect?.();
       const s = window.getComputedStyle(el as HTMLElement);
       return !!r && r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
     };
     const wantedRe = /(accetta.*tutto|accetta.*tutti|accept.*all|accept\s+all|allow.*all)/i;
-
-    // Any clickable-looking element: button, a, [role="button"], .accbtn, input[type=button|submit]
     const candidates = all.filter(el => {
       if (!isVisible(el)) return false;
       const tag = el.tagName.toLowerCase();
@@ -761,102 +703,46 @@ async function dismissCookieConsent(page: Page): Promise<void> {
       if ((el as HTMLElement).classList?.contains("accbtn")) return true;
       return false;
     }) as HTMLElement[];
-
-    // Match by innerText OR aria-label
     const target = candidates.find(c => {
       const text = (c.innerText || (c as HTMLInputElement).value || "").trim();
       const aria = c.getAttribute("aria-label") || "";
       return wantedRe.test(text) || wantedRe.test(aria);
     });
     if (!target) return false;
-    try {
-      target.click();
-      return true;
-    } catch { return false; }
+    try { target.click(); return true; } catch { return false; }
   }).catch(() => false);
 
   if (walkerClicked) {
     await page.waitForTimeout(700);
-    logger.info("[auth-session] Cookie banner dismissed via DOM walker fallback");
+    logger.info("[auth-session] cookie: dismissed via DOM walker fallback");
     return;
   }
 
-  logger.warn("[auth-session] Could not dismiss cookie banner via any strategy. Login form may be blocked; will still try to find it.");
+  logger.warn("[auth-session] cookie: could not dismiss via any strategy — login may be blocked");
 }
 
-async function robustFill(page: Page, selectorSpec: string, value: string): Promise<void> {
-  // selectorSpec can be "js=<expr>" for shadow DOM, XPath, or a CSS chain.
-  const selectors = selectorSpec.split(" ").filter(Boolean);
-  for (const sel of selectors) {
-    try {
-      if (sel.startsWith("js=")) {
-        const jsExpr = sel.slice(3);
-        const filled = await page.evaluate(({ expr, v }) => {
-          try {
-            // eslint-disable-next-line @typescript-eslint/no-implied-eval
-            const el = new Function(`return (${expr});`)() as HTMLInputElement | null;
-            if (!el) return false;
-            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-            nativeSetter?.call(el, v);
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
-            el.dispatchEvent(new Event("blur", { bubbles: true }));
-            return true;
-          } catch { return false; }
-        }, { expr: jsExpr, v: value });
-        if (filled) return;
-        continue;
-      }
-      const locator = sel.startsWith("//") ? page.locator(`xpath=${sel}`) : page.locator(sel);
-      if (await locator.count() > 0) {
-        await locator.first().fill(value, { timeout: 5000 });
-        return;
-      }
-    } catch { /* try next */ }
-  }
-  throw new Error(`Could not fill field for selector spec: ${selectorSpec.slice(0, 80)}...`);
-}
-
-async function robustClick(page: Page, selectorSpec: string): Promise<boolean> {
-  const selectors = selectorSpec.split(" ").filter(Boolean);
-  for (const sel of selectors) {
-    try {
-      if (sel.startsWith("js=")) {
-        const jsExpr = sel.slice(3);
-        const clicked = await page.evaluate(({ expr }) => {
-          try {
-            // eslint-disable-next-line @typescript-eslint/no-implied-eval
-            const el = new Function(`return (${expr});`)() as HTMLElement | null;
-            if (!el) return false;
-            el.click();
-            return true;
-          } catch { return false; }
-        }, { expr: jsExpr });
-        if (clicked) return true;
-        continue;
-      }
-      const locator = sel.startsWith("//") ? page.locator(`xpath=${sel}`) : page.locator(sel);
-      if (await locator.count() > 0) {
-        await locator.first().click({ timeout: 5000 });
-        return true;
-      }
-    } catch { /* try next */ }
-  }
-  return false;
-}
-
-async function waitForSecurityPage(page: Page, timeoutMs: number): Promise<void> {
+async function waitForSecurityPage(page: Page, timeoutMs: number, sid: string): Promise<void> {
   const start = Date.now();
+  let lastLoggedUrl = "";
+  let iter = 0;
   while (Date.now() - start < timeoutMs) {
+    iter++;
     try {
       const url = page.url();
+      if (url !== lastLoggedUrl) {
+        logger.info(`[auth-session ${sid}] waitForSecurityPage iter=${iter} URL=${url}`);
+        lastLoggedUrl = url;
+      }
       const title = await page.title().catch(() => "");
+      const inputCount = await page.locator("input[maxlength='1']").count().catch(() => 0);
       const looksLikeSecurity = /security|otp|verify|mfa|2fa/i.test(url) ||
         /security code|codice di sicurezza|Digita il codice/i.test(title) ||
-        (await page.locator("input[maxlength='1']").count()) >= 4;
-      if (looksLikeSecurity) return;
+        inputCount >= 4;
+      if (looksLikeSecurity) {
+        logger.info(`[auth-session ${sid}] waitForSecurityPage: detected security page after ${Date.now() - start}ms (url_match=${/security|otp|verify|mfa|2fa/i.test(url)}, title_match=${/security code|codice di sicurezza|Digita il codice/i.test(title)}, otp_boxes=${inputCount})`);
+        return;
+      }
 
-      // Bot-block check
       const errorText = await page.evaluate(() => {
         const body = document.body?.innerText || "";
         return /Ops! Qualcosa non va|cannot access|access denied|blocked/i.test(body) ? body.slice(0, 300) : null;
@@ -864,30 +750,31 @@ async function waitForSecurityPage(page: Page, timeoutMs: number): Promise<void>
       if (errorText) throw new Error(`Sky returned a block/error page after Accedi: ${errorText.slice(0, 200)}`);
     } catch (err: any) {
       if (err?.message?.startsWith("Sky returned")) throw err;
-      // otherwise ignore and retry
     }
     await page.waitForTimeout(500);
   }
-  throw new Error("Security/OTP page did not appear within 25s after clicking Accedi.");
+  throw new Error(`Security/OTP page did not appear within ${timeoutMs / 1000}s after clicking Accedi.`);
 }
 
-async function clickDeliveryChannel(page: Page, channel: "email" | "sms"): Promise<void> {
-  // Sky iD's channel-switch links may be <a>, <button>, or <span> with a
-  // click handler. Instead of matching by tag+text, use getByText which
-  // matches ANY element containing the text - then click that element or
-  // its nearest interactive ancestor.
-  //
-  // Ship 2g fix — broadened the "already on target" regex to accept more of
-  // Sky's language variants ("Ti abbiamo inviato una email", "una e-mail")
-  // and added a DOM-walker fallback that mirrors dismissCookieConsent's,
-  // so channel-switch buttons wrapped in custom elements are reachable.
-  // Also logs a diagnostic body-text sample when we can't verify, which
-  // makes debugging future Sky copy changes much easier.
+// -----------------------------------------------------------------------------
+// clickDeliveryChannel — AZURE-HARDENED
+// -----------------------------------------------------------------------------
+// Root problem: on Azure App Service + xvfb, the previous synthetic
+// element.click() (fired from inside page.evaluate) sometimes didn't trigger
+// Sky's SPA handler. The page LOOKED clicked from our side but Sky never
+// received a "user tapped the link" signal, so it stayed on the SMS default.
+//
+// Two changes vs local-only behaviour:
+//   (a) Use real page.mouse.click(x, y) — these are actual X server events
+//       via xvfb, indistinguishable from a real human click.
+//   (b) Verify after each click; retry up to CHANNEL_SWITCH_ATTEMPTS times;
+//       THROW if verification never confirms. No more "benefit of the doubt".
+//
+// Failure mode is now: user sees "Failed to switch OTP delivery to email
+// after 3 attempts" and can retry or pick SMS. Better than the previous
+// silent lie where UI said "email" but Sky sent SMS.
 
-  // Before we click, wait for the OTP page to be fully interactive.
-  await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => undefined);
-  await page.waitForTimeout(1500);
-
+async function clickDeliveryChannel(page: Page, channel: "email" | "sms", sid: string): Promise<void> {
   const emailTexts = [
     "Invia tramite email",
     "Invia tramite e-mail",
@@ -901,182 +788,169 @@ async function clickDeliveryChannel(page: Page, channel: "email" | "sms"): Promi
     "Invia via SMS",
   ];
   const targetTexts = channel === "email" ? emailTexts : smsTexts;
-  // Ship 2g fix — Sky says variants like:
-  //   "Abbiamo inviato una email"
-  //   "Ti abbiamo inviato una e-mail"
-  //   "Abbiamo inviato un SMS con un codice OTP di sicurezza"
-  // The old regex missed "Ti abbiamo inviato" and the un-hyphenated "email".
   const alreadyOnTarget = channel === "email"
     ? /(Abbiamo|Ti\s+abbiamo)\s+inviato\s+(un|una)\s+e-?mail/i
     : /(Abbiamo|Ti\s+abbiamo)\s+inviato\s+un\s+SMS/i;
 
-  // If we're already on the target channel, no click needed.
-  const bodyText = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
-  if (alreadyOnTarget.test(bodyText)) {
-    logger.info(`[auth-session] Page already on ${channel} channel; no switch needed.`);
+  const verifyOnTarget = async (): Promise<{ ok: boolean; reason: string; sample: string }> => {
+    const body = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
+    if (alreadyOnTarget.test(body)) return { ok: true, reason: "confirmation-text", sample: body.slice(0, 120) };
+    if (channel === "email" && /EMAIL\s*:\s*[^\s]+@[^\s]+/i.test(body)) {
+      return { ok: true, reason: "email-recipient-visible", sample: body.slice(0, 120) };
+    }
+    if (channel === "sms" && (/PHONE\s*:\s*[\+\d]/i.test(body) || /TELEFONO\s*:\s*[\+\d]/i.test(body))) {
+      return { ok: true, reason: "phone-recipient-visible", sample: body.slice(0, 120) };
+    }
+    return { ok: false, reason: "no-target-marker", sample: body.slice(0, 200) };
+  };
+
+  logger.info(`[auth-session ${sid}] clickDeliveryChannel: waiting ${HYDRATION_WAIT_MS}ms + networkidle for OTP page hydration`);
+  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => undefined);
+  await page.waitForTimeout(HYDRATION_WAIT_MS);
+
+  const initial = await verifyOnTarget();
+  if (initial.ok) {
+    logger.info(`[auth-session ${sid}] clickDeliveryChannel: already on ${channel} channel (${initial.reason}); no switch needed`);
     return;
   }
+  logger.info(`[auth-session ${sid}] clickDeliveryChannel: not yet on ${channel}, sample body: "${initial.sample.slice(0, 200)}"`);
 
-  const frames = page.frames();
-  for (const frame of frames) {
-    for (const text of targetTexts) {
-      try {
-        // getByText matches ANY element containing this text (span/div/a/button).
-        const el = frame.getByText(text, { exact: false }).first();
-        const count = await el.count().catch(() => 0);
-        if (count === 0) continue;
+  for (let attempt = 1; attempt <= CHANNEL_SWITCH_ATTEMPTS; attempt++) {
+    logger.info(`[auth-session ${sid}] clickDeliveryChannel: attempt ${attempt}/${CHANNEL_SWITCH_ATTEMPTS} for "${channel}"`);
 
-        // Wait up to 2 seconds for the element to be visible/attached, not 300ms.
-        try {
-          await el.waitFor({ state: "visible", timeout: 2000 });
-        } catch { continue; }
-
-        logger.info(`[auth-session] Found delivery-channel text "${text}"; clicking`);
-
-        // Try normal click first; if intercepted, force-click.
-        try {
-          await el.click({ timeout: 3000 });
-        } catch (clickErr: any) {
-          logger.info(`[auth-session] Normal click failed (${clickErr?.message?.slice(0, 60)}), trying force-click`);
-          await el.click({ timeout: 3000, force: true }).catch(() => undefined);
+    // Step 1: find coordinates of the switch link via a shadow-DOM walker,
+    // scroll it into view, return its centre.
+    const coords = await page.evaluate((texts: string[]) => {
+      function walkAll(root: Document | ShadowRoot, out: Element[]) {
+        const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
+        let n: Node | null = walker.currentNode;
+        while (n) {
+          if (n.nodeType === 1) {
+            const el = n as Element;
+            out.push(el);
+            if ((el as any).shadowRoot) walkAll((el as any).shadowRoot, out);
+          }
+          n = walker.nextNode();
         }
-
-        // Wait for the page to re-render.
-        await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => undefined);
-        await page.waitForTimeout(2000);
-
-        // Verify the switch actually took effect.
-        const newBodyText = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
-        if (alreadyOnTarget.test(newBodyText)) {
-          logger.info(`[auth-session] Verified: page now shows ${channel} channel.`);
-          return;
-        }
-        // Also accept if the visible recipient looks like an email (channel=email)
-        // or a phone (channel=sms).
-        const recipientLooksRight = channel === "email"
-          ? /EMAIL\s*:\s*[^\s]+@[^\s]+/i.test(newBodyText)
-          : /PHONE\s*:\s*[\+\d]/i.test(newBodyText) || /TELEFONO\s*:\s*[\+\d]/i.test(newBodyText);
-        if (recipientLooksRight) {
-          logger.info(`[auth-session] Verified: recipient info now shows ${channel} format.`);
-          return;
-        }
-
-        logger.warn(`[auth-session] Clicked "${text}" but page still does not appear to be on ${channel} channel. Body text sample: "${newBodyText.slice(0, 200)}"`);
-        // Don't return - try the next variant / frame in case we misidentified.
-      } catch (err: any) {
-        logger.info(`[auth-session] Attempt with text "${text}" errored: ${err?.message?.slice(0, 80)}`);
       }
-    }
-  }
+      const all: Element[] = [];
+      walkAll(document, all);
 
-  // Ship 2g fix — DOM walker fallback. If Playwright's getByText missed the
-  // element (e.g. it's inside a shadow root or the visible text has extra
-  // whitespace/HTML entities), walk the entire DOM ourselves.
-  logger.info(`[auth-session] Playwright locators exhausted for ${channel}; trying DOM walker fallback`);
-  const wantedRe = channel === "email"
-    ? /invia\s+tramite\s+e-?mail|send\s+by\s+e-?mail|send\s+via\s+e-?mail/i
-    : /invia\s+(di\s+nuovo\s+)?via\s+sms|resend\s+via\s+sms|send\s+via\s+sms/i;
-  const walkerClicked = await page.evaluate((pattern: string) => {
-    const re = new RegExp(pattern, "i");
-    function walkAll(root: Document | ShadowRoot, out: Element[]) {
-      const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
-      let n: Node | null = walker.currentNode;
-      while (n) {
-        if (n.nodeType === 1) {
-          const el = n as Element;
-          out.push(el);
-          if ((el as any).shadowRoot) walkAll((el as any).shadowRoot, out);
+      const isVisible = (el: Element) => {
+        const r = (el as HTMLElement).getBoundingClientRect?.();
+        const s = window.getComputedStyle(el as HTMLElement);
+        return !!r && r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+      };
+
+      const asClickable = (el: Element): HTMLElement | null => {
+        let cur: Element | null = el;
+        while (cur) {
+          const tag = cur.tagName.toLowerCase();
+          const role = cur.getAttribute("role");
+          if (tag === "button" || tag === "a" || role === "button") return cur as HTMLElement;
+          cur = cur.parentElement;
         }
-        n = walker.nextNode();
-      }
-    }
-    const all: Element[] = [];
-    walkAll(document, all);
+        return null;
+      };
 
-    const isVisible = (el: Element) => {
-      const r = (el as HTMLElement).getBoundingClientRect?.();
-      const s = window.getComputedStyle(el as HTMLElement);
-      return !!r && r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
-    };
-
-    // Prefer elements that ARE clickable (button/a/role=button); if none match,
-    // fall back to the smallest matching text node's ancestor button/a/[role].
-    const asClickable = (el: Element): HTMLElement | null => {
-      let cur: Element | null = el;
-      while (cur) {
-        const tag = cur.tagName.toLowerCase();
-        const role = cur.getAttribute("role");
-        if (tag === "button" || tag === "a" || role === "button") return cur as HTMLElement;
-        cur = cur.parentElement;
+      // First pass: prefer an element that IS clickable (button/a/[role=button])
+      // whose own innerText matches one of the target strings.
+      for (const el of all) {
+        if (!isVisible(el)) continue;
+        const tag = el.tagName.toLowerCase();
+        const role = el.getAttribute("role");
+        if (!(tag === "button" || tag === "a" || role === "button")) continue;
+        const text = ((el as HTMLElement).innerText || "").trim();
+        if (text.length > 80) continue;
+        if (!texts.some(t => text.toLowerCase().includes(t.toLowerCase()))) continue;
+        (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as any });
+        const r = (el as HTMLElement).getBoundingClientRect();
+        return {
+          x: Math.round(r.left + r.width / 2),
+          y: Math.round(r.top + r.height / 2),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          text: text.slice(0, 60),
+          tag,
+          strategy: "direct-clickable",
+        };
       }
+
+      // Second pass: any visible small element whose text matches, bubble up
+      // to a clickable ancestor.
+      for (const el of all) {
+        if (!isVisible(el)) continue;
+        const text = ((el as HTMLElement).innerText || "").trim();
+        if (text.length === 0 || text.length > 80) continue;
+        if (!texts.some(t => text.toLowerCase().includes(t.toLowerCase()))) continue;
+        const clickable = asClickable(el) || (el as HTMLElement);
+        clickable.scrollIntoView({ block: "center", behavior: "instant" as any });
+        const r = clickable.getBoundingClientRect();
+        return {
+          x: Math.round(r.left + r.width / 2),
+          y: Math.round(r.top + r.height / 2),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          text: (clickable.innerText || "").trim().slice(0, 60),
+          tag: clickable.tagName.toLowerCase(),
+          strategy: "ancestor-clickable",
+        };
+      }
+
       return null;
-    };
+    }, targetTexts).catch(() => null);
 
-    // Direct match first: an <a>/<button>/[role=button] whose own innerText matches.
-    const direct = all.find(el => {
-      if (!isVisible(el)) return false;
-      const tag = el.tagName.toLowerCase();
-      const role = el.getAttribute("role");
-      if (!(tag === "button" || tag === "a" || role === "button")) return false;
-      const text = ((el as HTMLElement).innerText || "").trim();
-      return re.test(text);
-    }) as HTMLElement | undefined;
-    if (direct) {
-      try { direct.click(); return { hit: true, via: "direct", text: (direct.innerText || "").slice(0, 80) }; }
-      catch { return { hit: false, via: "direct-click-threw", text: "" }; }
+    if (!coords) {
+      logger.warn(`[auth-session ${sid}] clickDeliveryChannel: attempt ${attempt}: no matching element found for "${channel}" in DOM`);
+      const bodyDump = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || "").catch(() => "");
+      logger.info(`[auth-session ${sid}] clickDeliveryChannel: body sample = "${bodyDump.slice(0, 300)}"`);
+      await page.waitForTimeout(2000);
+      continue;
     }
 
-    // Fallback: any visible element whose OWN text matches, then bubble up to a clickable ancestor.
-    const anyMatch = all.find(el => {
-      if (!isVisible(el)) return false;
-      const text = ((el as HTMLElement).innerText || "").trim();
-      // Ignore massive containers (avoid clicking body/main)
-      if (text.length > 60) return false;
-      return re.test(text);
-    });
-    if (anyMatch) {
-      const clickable = asClickable(anyMatch);
-      if (clickable) {
-        try { clickable.click(); return { hit: true, via: "ancestor", text: (clickable.innerText || "").slice(0, 80) }; }
-        catch { return { hit: false, via: "ancestor-click-threw", text: "" }; }
-      }
-      // Last resort: click the matching element itself.
-      try { (anyMatch as HTMLElement).click(); return { hit: true, via: "self", text: (anyMatch as HTMLElement).innerText.slice(0, 80) }; }
-      catch { /* fall through */ }
-    }
-    return { hit: false, via: "no-match", text: "" };
-  }, wantedRe.source).catch(() => ({ hit: false, via: "eval-failed", text: "" }));
+    logger.info(`[auth-session ${sid}] clickDeliveryChannel: found ${coords.strategy} "<${coords.tag}> ${coords.text}" at (${coords.x},${coords.y}) size ${coords.w}x${coords.h}`);
 
-  if (walkerClicked.hit) {
-    logger.info(`[auth-session] DOM walker clicked ${channel} channel via ${walkerClicked.via}: "${walkerClicked.text}"`);
-    await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => undefined);
-    await page.waitForTimeout(2000);
-    const newBodyText = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
-    if (alreadyOnTarget.test(newBodyText)) {
-      logger.info(`[auth-session] Verified after walker click: page now on ${channel}`);
+    // Step 2: real mouse click via xvfb. Move → down → up with small pauses
+    // so Sky's handlers can observe pointerdown/pointerup like a real user.
+    try {
+      await page.mouse.move(coords.x, coords.y, { steps: 5 });
+      await page.waitForTimeout(150);
+      await page.mouse.down();
+      await page.waitForTimeout(80);
+      await page.mouse.up();
+      logger.info(`[auth-session ${sid}] clickDeliveryChannel: mouse click dispatched`);
+    } catch (mouseErr: any) {
+      logger.warn(`[auth-session ${sid}] clickDeliveryChannel: mouse click threw: ${mouseErr?.message?.slice(0, 120)}`);
+    }
+
+    // Step 3: wait for the SPA to re-render + send the new OTP.
+    await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => undefined);
+    await page.waitForTimeout(3000);
+
+    // Step 4: verify.
+    const verify = await verifyOnTarget();
+    if (verify.ok) {
+      logger.info(`[auth-session ${sid}] clickDeliveryChannel: SUCCESS after attempt ${attempt} (${verify.reason})`);
       return;
     }
-    const recipientLooksRight = channel === "email"
-      ? /EMAIL\s*:\s*[^\s]+@[^\s]+/i.test(newBodyText)
-      : /PHONE\s*:\s*[\+\d]/i.test(newBodyText) || /TELEFONO\s*:\s*[\+\d]/i.test(newBodyText);
-    if (recipientLooksRight) {
-      logger.info(`[auth-session] Verified after walker click: recipient now shows ${channel}`);
-      return;
-    }
-    logger.warn(`[auth-session] Walker clicked ${channel} target but verification failed. Body: "${newBodyText.slice(0, 300)}"`);
-    // Give Sky the benefit of the doubt — click succeeded, verification is soft.
-    return;
+    logger.warn(`[auth-session ${sid}] clickDeliveryChannel: attempt ${attempt} did not verify. Reason: ${verify.reason}. Body sample: "${verify.sample.slice(0, 200)}"`);
+    await page.waitForTimeout(1500);
   }
 
-  // Log a diagnostic body-text sample so future Sky copy changes are debuggable.
+  // All attempts exhausted. Fail loudly.
   const finalBody = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
-  logger.warn(`[auth-session] Could not switch delivery to "${channel}" on any frame. Walker result: ${walkerClicked.via}. Sky will use its default. Body sample: "${finalBody.slice(0, 500)}"`);
+  logger.error(`[auth-session ${sid}] clickDeliveryChannel: FAILED after ${CHANNEL_SWITCH_ATTEMPTS} attempts. Body: "${finalBody.slice(0, 500)}"`);
+  throw new Error(
+    `Failed to switch OTP delivery to "${channel}" after ${CHANNEL_SWITCH_ATTEMPTS} attempts. ` +
+    `Sky may have sent the OTP via its default channel. ` +
+    `Try again in a moment, or select the SMS channel instead. ` +
+    `Page body sample: "${finalBody.slice(0, 200)}"`
+  );
 }
 
 async function extractMaskedRecipient(page: Page): Promise<string | undefined> {
   return await page.evaluate(() => {
     const body = document.body?.innerText || "";
-    // Match "PHONE : +3934...980" or "EMAIL : mobil...com"
     const phoneMatch = body.match(/PHONE\s*:\s*([\+\d\s\-]+)/i) || body.match(/TELEFONO\s*:\s*([\+\d\s\-]+)/i);
     const emailMatch = body.match(/EMAIL\s*:\s*([^\s]+@[^\s]+)/i);
     return phoneMatch?.[1]?.trim() || emailMatch?.[1]?.trim();
@@ -1084,16 +958,8 @@ async function extractMaskedRecipient(page: Page): Promise<string | undefined> {
 }
 
 async function fillOtpBoxes(page: Page, otp: string): Promise<void> {
-  // Sky splits the OTP across six single-character inputs. These are often
-  // inside a shadow DOM (custom element like <sky-otp-component>). Use the
-  // same recursive walker we use for the login form. Also search all frames.
-  //
-  // Success criteria: the input's .value equals the digit after typing.
-
-  // Wait a moment in case the page is still finishing an animation.
   await page.waitForTimeout(500);
 
-  // Cross-frame + shadow-DOM discovery of OTP-input candidates.
   const found = await page.evaluate(() => {
     function walkAll(root: Document | ShadowRoot, out: Element[]) {
       const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
@@ -1116,12 +982,6 @@ async function fillOtpBoxes(page: Page, otp: string): Promise<void> {
       return !!r && r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
     };
 
-    // Match single-char input candidates:
-    //   <input maxlength="1"> (most common)
-    //   <input maxlength="1" type="tel">
-    //   <input maxlength="1" type="text">
-    //   <input maxlength="1" type="number">
-    //   <input> inside class *otp* / *code* with any maxlength
     const inputs = all.filter(el =>
       el.tagName === "INPUT" &&
       isVisible(el) &&
@@ -1130,7 +990,6 @@ async function fillOtpBoxes(page: Page, otp: string): Promise<void> {
         /otp|code/i.test(el.id || ""))
     ) as HTMLInputElement[];
 
-    // Tag them for retrieval by index.
     inputs.forEach((el, i) => { (el as any).dataset.axessiaOtpIndex = String(i); });
 
     return {
@@ -1149,7 +1008,6 @@ async function fillOtpBoxes(page: Page, otp: string): Promise<void> {
   logger.info(`[auth-session] fillOtpBoxes: found ${found.count} OTP input candidates`);
   if (found.count === 0) {
     logger.info(`[auth-session] fillOtpBoxes: sample DOM state: ${JSON.stringify(found.sampleAttrs).slice(0, 300)}`);
-    // Log a broader input inventory so we can see what IS on the page.
     const allInputs = await page.evaluate(() => {
       const out: any[] = [];
       function walkAll(root: Document | ShadowRoot, out2: Element[]) {
@@ -1191,8 +1049,6 @@ async function fillOtpBoxes(page: Page, otp: string): Promise<void> {
     throw new Error(`Only found ${found.count} OTP boxes, expected ${otp.length}.`);
   }
 
-  // Fill each box, verifying the value stuck. Uses the same shadow-DOM walker
-  // pattern as fillDetectedField so it works through custom elements.
   for (let i = 0; i < otp.length; i++) {
     const digit = otp[i];
     const ok = await page.evaluate(({ index, value }) => {
@@ -1235,7 +1091,6 @@ async function fillOtpBoxes(page: Page, otp: string): Promise<void> {
 }
 
 async function clickConferma(page: Page): Promise<void> {
-  // Try to find the Conferma button - may be inside shadow DOM.
   const clicked = await page.evaluate(() => {
     function walkAll(root: Document | ShadowRoot, out: Element[]) {
       const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
@@ -1263,16 +1118,12 @@ async function clickConferma(page: Page): Promise<void> {
       isVisible(el)
     ) as HTMLElement[];
 
-    // Prefer buttons whose text says Conferma / He confirms / Verify.
     const conferma = buttons.find(b =>
       /conferma|he confirms|confirm|verify|verifica/i.test((b.innerText || (b as HTMLInputElement).value || "").trim())
     );
     const target = conferma || buttons.find(b => (b as HTMLButtonElement | HTMLInputElement).type === "submit");
     if (!target) return false;
-    try {
-      target.click();
-      return true;
-    } catch { return false; }
+    try { target.click(); return true; } catch { return false; }
   }).catch(() => false);
 
   if (!clicked) {
@@ -1284,14 +1135,6 @@ async function clickConferma(page: Page): Promise<void> {
 }
 
 async function waitForAuthenticatedLanding(page: Page, targetUrl: string): Promise<void> {
-  // Sky iD's flow can redirect through 3-5 intermediate URLs after OTP
-  // submission (OAuth-style forward= parameter, service-specific callback,
-  // final landing). We wait for either:
-  //   1. URL no longer contains login/security/otp/verify/mfa words, OR
-  //   2. URL matches the target host, OR
-  //   3. 40 seconds elapse without progress
-  //
-  // A visible OTP error message aborts immediately.
   const start = Date.now();
   const timeoutMs = 40000;
   let targetHost: string | null = null;
@@ -1312,13 +1155,10 @@ async function waitForAuthenticatedLanding(page: Page, targetUrl: string): Promi
     try { hostMatch = new URL(currentUrl).hostname === targetHost; } catch { /* ignore */ }
 
     if (!onAuthPage && (hostMatch || !currentUrl.includes("sky.it/security"))) {
-      // Give the page 1 more second to fully load its content before returning.
       await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(() => undefined);
       return;
     }
 
-    // Check for a visible OTP error on the page (only when we're actually
-    // still on the OTP page - don't false-positive on other pages).
     if (onAuthPage) {
       const errorText = await page.evaluate(() => {
         const body = document.body?.innerText || "";
@@ -1328,7 +1168,6 @@ async function waitForAuthenticatedLanding(page: Page, targetUrl: string): Promi
       if (errorText) throw new Error(`Sky reported an OTP error: ${errorText.slice(0, 200)}`);
     }
 
-    // If the URL hasn't changed in 20s while still on an auth page, we're stuck.
     if (onAuthPage && Date.now() - unchangedSince > 20000) {
       throw new Error(`URL has not progressed past auth page for 20s. Current URL: ${currentUrl}`);
     }
