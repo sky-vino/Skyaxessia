@@ -25,14 +25,14 @@ node -e "require('sqlite3'); console.log('sqlite3 OK')" || {
   exit 1
 }
 
-# ─── INSTALL CHROMIUM SYSTEM LIBRARIES + XVFB ──────────────────────────────
-# Chromium needs libglib etc. AND xvfb (virtual display) because the app
-# launches the browser in HEADED mode for anti-bot-detection stealth.
-# Azure App Service has no real display, so xvfb-run provides a fake one.
-if ldconfig -p 2>/dev/null | grep -q "libglib-2.0.so.0" && command -v xvfb-run >/dev/null 2>&1; then
-  echo "==> Chromium libs + xvfb already present (warm start)"
+# ─── INSTALL CHROMIUM SYSTEM LIBRARIES + XVFB + XAUTH ──────────────────────
+# xauth is required by xvfb-run to allocate the display.
+if ldconfig -p 2>/dev/null | grep -q "libglib-2.0.so.0" \
+   && command -v Xvfb >/dev/null 2>&1 \
+   && command -v xauth >/dev/null 2>&1; then
+  echo "==> Chromium libs + Xvfb + xauth already present (warm start)"
 else
-  echo "==> Installing Chromium system libs + xvfb (~30-60s, one-time per cold start)..."
+  echo "==> Installing Chromium system libs + xvfb + xauth (~30-60s)..."
   apt-get update -qq 2>&1 | tail -3
   apt-get install -y --no-install-recommends \
     libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
@@ -40,11 +40,11 @@ else
     libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
     libcairo2 libasound2 libxshmfence1 libx11-xcb1 libxcb1 \
     libxext6 libxi6 libxtst6 fonts-liberation \
-    xvfb 2>&1 | tail -5
-  if command -v xvfb-run >/dev/null 2>&1; then
-    echo "==> Chromium libs + xvfb installed successfully"
+    xvfb xauth 2>&1 | tail -5
+  if command -v Xvfb >/dev/null 2>&1 && command -v xauth >/dev/null 2>&1; then
+    echo "==> Chromium libs + Xvfb + xauth installed successfully"
   else
-    echo "WARNING: xvfb install may have failed — scans will fail"
+    echo "WARNING: Xvfb or xauth missing — scans will fail"
   fi
 fi
 # ────────────────────────────────────────────────────────────────────────────
@@ -56,13 +56,25 @@ ls -la /home/site/wwwroot/backend/dist | head -5 || echo "(missing)"
 echo "==> Frontend dist:"
 ls -la /home/site/wwwroot/frontend/dist | head -5 || echo "(missing)"
 
-cd /home/site/wwwroot/backend
-echo "==> Launching: xvfb-run node dist/index.js on port $PORT"
+# ─── START XVFB IN BACKGROUND, POINT DISPLAY AT IT ─────────────────────────
+# Directly starting Xvfb sidesteps xvfb-run entirely (which needs xauth).
+# Any Chromium child process inherits DISPLAY=:99 and renders into the
+# virtual framebuffer with no real GUI.
+echo "==> Starting Xvfb on :99..."
+Xvfb :99 -screen 0 1366x768x24 -ac +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 &
+XVFB_PID=$!
+export DISPLAY=:99
 
-# ─── LAUNCH INSIDE XVFB VIRTUAL DISPLAY ────────────────────────────────────
-# xvfb-run -a: auto-pick an available display number
-# --server-args: set virtual screen resolution matching what the app uses
-# The node process runs normally, but every Chromium child process it
-# launches will see DISPLAY=:99 and render into the virtual framebuffer.
-exec xvfb-run -a --server-args="-screen 0 1366x768x24 -ac +extension GLX +render -noreset" \
-  node dist/index.js
+# Give Xvfb ~2s to initialise
+sleep 2
+if kill -0 "$XVFB_PID" 2>/dev/null; then
+  echo "==> Xvfb running as PID $XVFB_PID on DISPLAY=$DISPLAY"
+else
+  echo "WARNING: Xvfb failed to start. Xvfb log:"
+  cat /tmp/xvfb.log || true
+  echo "Continuing without virtual display — scans will fail but app will boot."
+fi
+
+cd /home/site/wwwroot/backend
+echo "==> Launching: node dist/index.js on port $PORT"
+exec node dist/index.js
