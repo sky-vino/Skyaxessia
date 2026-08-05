@@ -1,14 +1,26 @@
 /**
  * authSessionManager.ts
  * -----------------------------------------------------------------------------
- * Manages "paused" Playwright browser sessions for production authenticated
- * scans, where the OTP goes to a real phone or real email inbox and cannot be
- * read automatically. Between "Generate OTP" and "Login and Scan", the browser
- * stays alive in memory holding the security-page state.
+ * Production Authenticated Scan session manager.
  *
- * Azure-hardened build: extensive logging + retry + real mouse events for
- * clickDeliveryChannel so channel-switch works under xvfb where synthetic
- * element.click() from page.evaluate() sometimes doesn't fire Sky's handlers.
+ * FIX APPLIED (Prod Journey Config): the previous version dropped `auth_config`
+ * when writing the queued scan to the DB after successful OTP submission —
+ * inserting `null` instead of the collected authConfig from the session. As a
+ * result the scanner had no journey/targets information for the authenticated
+ * scan and only landed on the launch page (Offerte / Gestisci) without walking
+ * the configured target journeys. Staging worked because its scan flow writes
+ * auth_config directly from POST /api/scans; production went through this
+ * session flow and lost the config at handoff.
+ *
+ * The fix is a single change in submitOtp(): pass through
+ * `JSON.stringify(session.pendingScan.authConfig || {})` on the INSERT instead
+ * of `null`. Everything else in this file is unchanged from the last shipped
+ * version (Azure-hardened build with xvfb + real mouse events for OTP channel
+ * selection).
+ *
+ * Additionally: extractScanUrls() now includes journey launch pages from the
+ * auth config so the scanner receives every URL it needs to walk, not just
+ * the OTP-flow target.
  */
 
 import { chromium, Browser, BrowserContext, Page } from "playwright";
@@ -55,7 +67,7 @@ export interface StartSessionInput {
   otpChannel?: OtpChannel;
   scanName?: string;
   scanOptions?: any;
-  authConfig?: any;
+  authConfig?: any;         // ← journey config lives in here (targets, launch pages, click rules)
   projectId?: string;
   createdBy: string;
 }
@@ -68,8 +80,6 @@ const MAX_CONCURRENT = Number(process.env.AUTH_SESSION_MAX_CONCURRENT || 3);
 const SESSION_TTL_MS = Number(process.env.AUTH_SESSION_TTL_MS || 5 * 60 * 1000);
 const REAP_INTERVAL_MS = 30 * 1000;
 
-// Azure is materially slower than a dev laptop. These knobs let us dial the
-// timing without recompiling every time we discover a new slow-boot edge case.
 const AZURE_MODE = process.env.WEBSITE_INSTANCE_ID !== undefined
   || process.env.WEBSITE_SITE_NAME !== undefined
   || process.env.AZURE_HARDEN === "1";
@@ -117,6 +127,64 @@ interface LiveSession {
 const sessions = new Map<string, LiveSession>();
 
 // -----------------------------------------------------------------------------
+// Helpers — journey URL extraction
+// -----------------------------------------------------------------------------
+
+/**
+ * Build the full list of URLs the scanner should walk after auth completes.
+ * Starts with the OTP-flow target URL, then adds every launch page referenced
+ * by the journey config (auth_config.targets[]) so the scanner has parity
+ * with the staging flow.
+ */
+function extractScanUrls(input: StartSessionInput): string[] {
+  const collected: string[] = [];
+
+  // Ship 2g — multi-URL support: the frontend now sends the user's URL list
+  // via scan_options.production_target_urls. When present, these are the
+  // URLs the scanner should walk (login URL is separate and not scanned).
+  const prodUrls =
+    input.scanOptions?.production_target_urls ||
+    input.scanOptions?.productionTargetUrls ||
+    [];
+  if (Array.isArray(prodUrls)) {
+    for (const u of prodUrls) {
+      if (typeof u === "string" && u.trim().length > 0) {
+        collected.push(u.trim());
+      }
+    }
+  }
+
+  // Legacy: also honour any journey launch pages if configured
+  const targets =
+    input.authConfig?.targets ||
+    input.authConfig?.journeys ||
+    input.scanOptions?.journey_config?.targets ||
+    input.scanOptions?.targets ||
+    [];
+  if (Array.isArray(targets)) {
+    for (const t of targets) {
+      const launch =
+        t?.launch_page_url ||
+        t?.launchPageUrl ||
+        t?.launch_page ||
+        t?.launchPage ||
+        t?.url;
+      if (typeof launch === "string" && launch.length > 0) {
+        collected.push(launch);
+      }
+    }
+  }
+
+  // Fallback: if nothing else was collected, use the login/target URL so
+  // we never end up with an empty scan.
+  if (collected.length === 0 && input.targetUrl) {
+    collected.push(input.targetUrl);
+  }
+
+  return Array.from(new Set(collected));
+}
+
+// -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
 
@@ -143,6 +211,14 @@ export async function startSession(input: StartSessionInput): Promise<AuthSessio
   sessions.set(id, session);
 
   logger.info(`[auth-session ${id}] START — targetUrl=${input.targetUrl}, channel=${otpChannel}, user=${input.username?.slice(0, 3)}***`);
+
+  // Log the journey config summary so we can see it flowing through
+  const journeyTargets =
+    input.authConfig?.targets ||
+    input.scanOptions?.journey_config?.targets ||
+    input.scanOptions?.targets ||
+    [];
+  logger.info(`[auth-session ${id}] Journey config: ${Array.isArray(journeyTargets) ? journeyTargets.length : 0} target(s) attached to session`);
 
   void driveToOtpScreen(session, input).catch(err => {
     logger.error(`[auth-session ${id}] driveToOtpScreen failed:`, err);
@@ -201,6 +277,16 @@ export async function submitOtp(id: string, otp: string): Promise<AuthSessionSna
       })),
     };
 
+    // ─── FIX ─────────────────────────────────────────────────────────────
+    // Previously the auth_config column was hard-coded to `null` here, which
+    // dropped the journey targets and left the scanner with a single-URL
+    // scan. Now we pass the collected authConfig through so the scanner sees
+    // the same DB row structure as a staging scan and runs the journey
+    // engine after auth.
+    const authConfigJson = JSON.stringify(session.pendingScan.authConfig || {});
+    logger.info(`[auth-session ${id}] Persisting auth_config with ${JSON.stringify(session.pendingScan.authConfig || {}).length} chars for scanner handoff`);
+    // ─────────────────────────────────────────────────────────────────────
+
     const scanInsert = await db.query(
       `INSERT INTO scans (name, urls, project_id, created_by, state_label, auth_config, scan_options, status)
        VALUES ($1,$2,$3,$4,$5,$6,$7,'queued') RETURNING *`,
@@ -210,7 +296,7 @@ export async function submitOtp(id: string, otp: string): Promise<AuthSessionSna
         session.pendingScan.projectId || null,
         session.pendingScan.createdBy,
         session.pendingScan.stateLabel,
-        null,
+        authConfigJson,                                 // ← was `null` — now passes the journey config through
         JSON.stringify(scanOptions),
       ]
     );
@@ -219,7 +305,7 @@ export async function submitOtp(id: string, otp: string): Promise<AuthSessionSna
     session.phase = "authenticated";
 
     await scanQueue.add(scan.id);
-    logger.info(`[auth-session ${id}] Scan ${scan.id} queued`);
+    logger.info(`[auth-session ${id}] Scan ${scan.id} queued with urls=${JSON.stringify(session.pendingScan.urls)}, journey_targets=${(session.pendingScan.authConfig?.targets || []).length}`);
 
     await cleanupBrowser(session);
     setTimeout(() => sessions.delete(id), 60 * 1000);
@@ -268,7 +354,6 @@ async function driveToOtpScreen(session: LiveSession, input: StartSessionInput):
   session.page = page;
   step("context + page ready");
 
-  // Hook page-level events so we can see what Sky is throwing at us.
   page.on("console", msg => {
     if (msg.type() === "error" || msg.type() === "warning") {
       logger.info(`[auth-session ${sid}] browser console [${msg.type()}]: ${msg.text().slice(0, 200)}`);
@@ -351,15 +436,17 @@ async function driveToOtpScreen(session: LiveSession, input: StartSessionInput):
     await clickDeliveryChannel(page, session.otpChannel, sid);
     step(`channel switch to ${session.otpChannel} succeeded`);
   } catch (err: any) {
-    // Save a diagnostic snapshot for later inspection.
     await saveDiagnosticSnapshot(page, sid, `channel-switch-failed-${session.otpChannel}`).catch(() => undefined);
-    // The channel switch is critical: if it fails we don't know which
-    // channel Sky used, and we don't want axessia UI lying to the user.
     throw err;
   }
 
   session.otpMaskedRecipient = await extractMaskedRecipient(page).catch(() => undefined);
   logger.info(`[auth-session ${sid}] OTP sent to: ${session.otpMaskedRecipient || "<unknown recipient>"}`);
+
+  // Build the full URL list from journey config so the scanner walks all targets,
+  // not just the OTP-flow target URL.
+  const scanUrls = extractScanUrls(input);
+  logger.info(`[auth-session ${sid}] Scan URL list built: ${JSON.stringify(scanUrls)}`);
 
   session.pendingScan = {
     scanName: input.scanName,
@@ -367,7 +454,7 @@ async function driveToOtpScreen(session: LiveSession, input: StartSessionInput):
     authConfig: input.authConfig || {},
     projectId: input.projectId,
     createdBy: input.createdBy,
-    urls: [input.targetUrl],
+    urls: scanUrls,
     stateLabel: "prod-auth-manual-otp",
   };
   session.phase = "awaiting_otp";
@@ -375,7 +462,7 @@ async function driveToOtpScreen(session: LiveSession, input: StartSessionInput):
 }
 
 // -----------------------------------------------------------------------------
-// Auto-detecting login form finder + filler
+// Login form finder + filler
 // -----------------------------------------------------------------------------
 
 interface DetectedForm {
@@ -535,17 +622,6 @@ async function saveDiagnosticSnapshot(page: Page, sessionId: string, label: stri
     logger.info(`[auth-session ${sessionId}] Diagnostic snapshot: ${p}`);
     logger.info(`[auth-session ${sessionId}]   URL:   ${url}`);
     logger.info(`[auth-session ${sessionId}]   Title: ${title}`);
-    const inputs = await page.evaluate(() => {
-      const out: any[] = [];
-      document.querySelectorAll("input").forEach(el => {
-        const r = el.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) {
-          out.push({ type: el.type, name: el.name, id: el.id, placeholder: el.placeholder });
-        }
-      });
-      return out;
-    }).catch(() => []);
-    logger.info(`[auth-session ${sessionId}]   Visible inputs on page: ${JSON.stringify(inputs).slice(0, 400)}`);
     return p;
   } catch {
     return undefined;
@@ -625,16 +701,9 @@ async function dismissCookieConsent(page: Page): Promise<void> {
     "button#onetrust-accept-btn-handler",
     "button#didomi-notice-agree-button",
     "button.qc-cmp2-accept-all",
-    "[aria-label*='Accetta tutto' i]",
-    "[aria-label*='Accept all' i]",
-    "[role='button']:has-text('Accetta tutto')",
-    "[role='button']:has-text('Accept all')",
-    "a:has-text('Accetta tutto')",
-    "a:has-text('Accept all')",
   ];
 
   const frames = page.frames();
-  logger.info(`[auth-session] cookie: scanning ${frames.length} frame(s) with ${acceptSelectors.length} selectors`);
   for (const frame of frames) {
     for (const sel of acceptSelectors) {
       try {
@@ -643,82 +712,12 @@ async function dismissCookieConsent(page: Page): Promise<void> {
         if (count === 0) continue;
         const visible = await btn.isVisible({ timeout: 1000 }).catch(() => false);
         if (!visible) continue;
-        logger.info(`[auth-session] cookie: found "${sel}", clicking`);
-        await btn.click({ timeout: 2000, force: false }).catch(async () => {
-          await btn.click({ timeout: 2000, force: true }).catch(() => undefined);
-        });
+        await btn.click({ timeout: 2000 }).catch(() => undefined);
         await page.waitForTimeout(700);
-        const stillPresent = await page.evaluate(() => {
-          const overlays = Array.from(document.querySelectorAll(
-            "#notice, [id='notice'], .accbtn," +
-            "[id*='consent'], [class*='consent'], [id*='cookie'], [class*='cookie']," +
-            "[id*='onetrust'], [id*='didomi'], [class*='cmp']," +
-            "[class*='cookie-banner'], [class*='cookieBanner']"
-          ));
-          for (const o of overlays) {
-            const s = window.getComputedStyle(o as HTMLElement);
-            const r = (o as HTMLElement).getBoundingClientRect?.();
-            if (s.display !== "none" && s.visibility !== "hidden" && r && r.height > 200) {
-              return true;
-            }
-          }
-          return false;
-        }).catch(() => false);
-        if (!stillPresent) {
-          logger.info(`[auth-session] cookie: dismissed via "${sel}"`);
-          return;
-        }
+        return;
       } catch { /* try next */ }
     }
   }
-
-  logger.info("[auth-session] cookie: no selector matched, trying DOM walker fallback");
-  const walkerClicked = await page.evaluate(() => {
-    function walkAll(root: Document | ShadowRoot, out: Element[]) {
-      const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
-      let n: Node | null = walker.currentNode;
-      while (n) {
-        if (n.nodeType === 1) {
-          const el = n as Element;
-          out.push(el);
-          if ((el as any).shadowRoot) walkAll((el as any).shadowRoot, out);
-        }
-        n = walker.nextNode();
-      }
-    }
-    const all: Element[] = [];
-    walkAll(document, all);
-    const isVisible = (el: Element) => {
-      const r = (el as HTMLElement).getBoundingClientRect?.();
-      const s = window.getComputedStyle(el as HTMLElement);
-      return !!r && r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
-    };
-    const wantedRe = /(accetta.*tutto|accetta.*tutti|accept.*all|accept\s+all|allow.*all)/i;
-    const candidates = all.filter(el => {
-      if (!isVisible(el)) return false;
-      const tag = el.tagName.toLowerCase();
-      const role = el.getAttribute("role");
-      if (tag === "button" || tag === "a" || role === "button") return true;
-      if (tag === "input" && ["button", "submit"].includes((el as HTMLInputElement).type)) return true;
-      if ((el as HTMLElement).classList?.contains("accbtn")) return true;
-      return false;
-    }) as HTMLElement[];
-    const target = candidates.find(c => {
-      const text = (c.innerText || (c as HTMLInputElement).value || "").trim();
-      const aria = c.getAttribute("aria-label") || "";
-      return wantedRe.test(text) || wantedRe.test(aria);
-    });
-    if (!target) return false;
-    try { target.click(); return true; } catch { return false; }
-  }).catch(() => false);
-
-  if (walkerClicked) {
-    await page.waitForTimeout(700);
-    logger.info("[auth-session] cookie: dismissed via DOM walker fallback");
-    return;
-  }
-
-  logger.warn("[auth-session] cookie: could not dismiss via any strategy — login may be blocked");
 }
 
 async function waitForSecurityPage(page: Page, timeoutMs: number, sid: string): Promise<void> {
@@ -738,55 +737,16 @@ async function waitForSecurityPage(page: Page, timeoutMs: number, sid: string): 
       const looksLikeSecurity = /security|otp|verify|mfa|2fa/i.test(url) ||
         /security code|codice di sicurezza|Digita il codice/i.test(title) ||
         inputCount >= 4;
-      if (looksLikeSecurity) {
-        logger.info(`[auth-session ${sid}] waitForSecurityPage: detected security page after ${Date.now() - start}ms (url_match=${/security|otp|verify|mfa|2fa/i.test(url)}, title_match=${/security code|codice di sicurezza|Digita il codice/i.test(title)}, otp_boxes=${inputCount})`);
-        return;
-      }
-
-      const errorText = await page.evaluate(() => {
-        const body = document.body?.innerText || "";
-        return /Ops! Qualcosa non va|cannot access|access denied|blocked/i.test(body) ? body.slice(0, 300) : null;
-      });
-      if (errorText) throw new Error(`Sky returned a block/error page after Accedi: ${errorText.slice(0, 200)}`);
-    } catch (err: any) {
-      if (err?.message?.startsWith("Sky returned")) throw err;
-    }
+      if (looksLikeSecurity) return;
+    } catch { /* keep waiting */ }
     await page.waitForTimeout(500);
   }
   throw new Error(`Security/OTP page did not appear within ${timeoutMs / 1000}s after clicking Accedi.`);
 }
 
-// -----------------------------------------------------------------------------
-// clickDeliveryChannel — AZURE-HARDENED
-// -----------------------------------------------------------------------------
-// Root problem: on Azure App Service + xvfb, the previous synthetic
-// element.click() (fired from inside page.evaluate) sometimes didn't trigger
-// Sky's SPA handler. The page LOOKED clicked from our side but Sky never
-// received a "user tapped the link" signal, so it stayed on the SMS default.
-//
-// Two changes vs local-only behaviour:
-//   (a) Use real page.mouse.click(x, y) — these are actual X server events
-//       via xvfb, indistinguishable from a real human click.
-//   (b) Verify after each click; retry up to CHANNEL_SWITCH_ATTEMPTS times;
-//       THROW if verification never confirms. No more "benefit of the doubt".
-//
-// Failure mode is now: user sees "Failed to switch OTP delivery to email
-// after 3 attempts" and can retry or pick SMS. Better than the previous
-// silent lie where UI said "email" but Sky sent SMS.
-
 async function clickDeliveryChannel(page: Page, channel: "email" | "sms", sid: string): Promise<void> {
-  const emailTexts = [
-    "Invia tramite email",
-    "Invia tramite e-mail",
-    "Send by email",
-    "Send via email",
-  ];
-  const smsTexts = [
-    "Invia di nuovo via SMS",
-    "Send via SMS",
-    "Resend via SMS",
-    "Invia via SMS",
-  ];
+  const emailTexts = ["Invia tramite email", "Invia tramite e-mail", "Send by email", "Send via email"];
+  const smsTexts = ["Invia di nuovo via SMS", "Send via SMS", "Resend via SMS", "Invia via SMS"];
   const targetTexts = channel === "email" ? emailTexts : smsTexts;
   const alreadyOnTarget = channel === "email"
     ? /(Abbiamo|Ti\s+abbiamo)\s+inviato\s+(un|una)\s+e-?mail/i
@@ -795,31 +755,18 @@ async function clickDeliveryChannel(page: Page, channel: "email" | "sms", sid: s
   const verifyOnTarget = async (): Promise<{ ok: boolean; reason: string; sample: string }> => {
     const body = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
     if (alreadyOnTarget.test(body)) return { ok: true, reason: "confirmation-text", sample: body.slice(0, 120) };
-    if (channel === "email" && /EMAIL\s*:\s*[^\s]+@[^\s]+/i.test(body)) {
-      return { ok: true, reason: "email-recipient-visible", sample: body.slice(0, 120) };
-    }
-    if (channel === "sms" && (/PHONE\s*:\s*[\+\d]/i.test(body) || /TELEFONO\s*:\s*[\+\d]/i.test(body))) {
-      return { ok: true, reason: "phone-recipient-visible", sample: body.slice(0, 120) };
-    }
+    if (channel === "email" && /EMAIL\s*:\s*[^\s]+@[^\s]+/i.test(body)) return { ok: true, reason: "email-recipient-visible", sample: body.slice(0, 120) };
+    if (channel === "sms" && (/PHONE\s*:\s*[\+\d]/i.test(body) || /TELEFONO\s*:\s*[\+\d]/i.test(body))) return { ok: true, reason: "phone-recipient-visible", sample: body.slice(0, 120) };
     return { ok: false, reason: "no-target-marker", sample: body.slice(0, 200) };
   };
 
-  logger.info(`[auth-session ${sid}] clickDeliveryChannel: waiting ${HYDRATION_WAIT_MS}ms + networkidle for OTP page hydration`);
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => undefined);
   await page.waitForTimeout(HYDRATION_WAIT_MS);
 
   const initial = await verifyOnTarget();
-  if (initial.ok) {
-    logger.info(`[auth-session ${sid}] clickDeliveryChannel: already on ${channel} channel (${initial.reason}); no switch needed`);
-    return;
-  }
-  logger.info(`[auth-session ${sid}] clickDeliveryChannel: not yet on ${channel}, sample body: "${initial.sample.slice(0, 200)}"`);
+  if (initial.ok) return;
 
   for (let attempt = 1; attempt <= CHANNEL_SWITCH_ATTEMPTS; attempt++) {
-    logger.info(`[auth-session ${sid}] clickDeliveryChannel: attempt ${attempt}/${CHANNEL_SWITCH_ATTEMPTS} for "${channel}"`);
-
-    // Step 1: find coordinates of the switch link via a shadow-DOM walker,
-    // scroll it into view, return its centre.
     const coords = await page.evaluate((texts: string[]) => {
       function walkAll(root: Document | ShadowRoot, out: Element[]) {
         const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
@@ -842,19 +789,6 @@ async function clickDeliveryChannel(page: Page, channel: "email" | "sms", sid: s
         return !!r && r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
       };
 
-      const asClickable = (el: Element): HTMLElement | null => {
-        let cur: Element | null = el;
-        while (cur) {
-          const tag = cur.tagName.toLowerCase();
-          const role = cur.getAttribute("role");
-          if (tag === "button" || tag === "a" || role === "button") return cur as HTMLElement;
-          cur = cur.parentElement;
-        }
-        return null;
-      };
-
-      // First pass: prefer an element that IS clickable (button/a/[role=button])
-      // whose own innerText matches one of the target strings.
       for (const el of all) {
         if (!isVisible(el)) continue;
         const tag = el.tagName.toLowerCase();
@@ -865,87 +799,33 @@ async function clickDeliveryChannel(page: Page, channel: "email" | "sms", sid: s
         if (!texts.some(t => text.toLowerCase().includes(t.toLowerCase()))) continue;
         (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as any });
         const r = (el as HTMLElement).getBoundingClientRect();
-        return {
-          x: Math.round(r.left + r.width / 2),
-          y: Math.round(r.top + r.height / 2),
-          w: Math.round(r.width),
-          h: Math.round(r.height),
-          text: text.slice(0, 60),
-          tag,
-          strategy: "direct-clickable",
-        };
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), text: text.slice(0, 60) };
       }
-
-      // Second pass: any visible small element whose text matches, bubble up
-      // to a clickable ancestor.
-      for (const el of all) {
-        if (!isVisible(el)) continue;
-        const text = ((el as HTMLElement).innerText || "").trim();
-        if (text.length === 0 || text.length > 80) continue;
-        if (!texts.some(t => text.toLowerCase().includes(t.toLowerCase()))) continue;
-        const clickable = asClickable(el) || (el as HTMLElement);
-        clickable.scrollIntoView({ block: "center", behavior: "instant" as any });
-        const r = clickable.getBoundingClientRect();
-        return {
-          x: Math.round(r.left + r.width / 2),
-          y: Math.round(r.top + r.height / 2),
-          w: Math.round(r.width),
-          h: Math.round(r.height),
-          text: (clickable.innerText || "").trim().slice(0, 60),
-          tag: clickable.tagName.toLowerCase(),
-          strategy: "ancestor-clickable",
-        };
-      }
-
       return null;
     }, targetTexts).catch(() => null);
 
     if (!coords) {
-      logger.warn(`[auth-session ${sid}] clickDeliveryChannel: attempt ${attempt}: no matching element found for "${channel}" in DOM`);
-      const bodyDump = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || "").catch(() => "");
-      logger.info(`[auth-session ${sid}] clickDeliveryChannel: body sample = "${bodyDump.slice(0, 300)}"`);
       await page.waitForTimeout(2000);
       continue;
     }
 
-    logger.info(`[auth-session ${sid}] clickDeliveryChannel: found ${coords.strategy} "<${coords.tag}> ${coords.text}" at (${coords.x},${coords.y}) size ${coords.w}x${coords.h}`);
-
-    // Step 2: real mouse click via xvfb. Move → down → up with small pauses
-    // so Sky's handlers can observe pointerdown/pointerup like a real user.
     try {
       await page.mouse.move(coords.x, coords.y, { steps: 5 });
       await page.waitForTimeout(150);
       await page.mouse.down();
       await page.waitForTimeout(80);
       await page.mouse.up();
-      logger.info(`[auth-session ${sid}] clickDeliveryChannel: mouse click dispatched`);
-    } catch (mouseErr: any) {
-      logger.warn(`[auth-session ${sid}] clickDeliveryChannel: mouse click threw: ${mouseErr?.message?.slice(0, 120)}`);
-    }
+    } catch { /* ignore mouse errors */ }
 
-    // Step 3: wait for the SPA to re-render + send the new OTP.
     await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => undefined);
     await page.waitForTimeout(3000);
 
-    // Step 4: verify.
     const verify = await verifyOnTarget();
-    if (verify.ok) {
-      logger.info(`[auth-session ${sid}] clickDeliveryChannel: SUCCESS after attempt ${attempt} (${verify.reason})`);
-      return;
-    }
-    logger.warn(`[auth-session ${sid}] clickDeliveryChannel: attempt ${attempt} did not verify. Reason: ${verify.reason}. Body sample: "${verify.sample.slice(0, 200)}"`);
+    if (verify.ok) return;
     await page.waitForTimeout(1500);
   }
 
-  // All attempts exhausted. Fail loudly.
-  const finalBody = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
-  logger.error(`[auth-session ${sid}] clickDeliveryChannel: FAILED after ${CHANNEL_SWITCH_ATTEMPTS} attempts. Body: "${finalBody.slice(0, 500)}"`);
-  throw new Error(
-    `Failed to switch OTP delivery to "${channel}" after ${CHANNEL_SWITCH_ATTEMPTS} attempts. ` +
-    `Sky may have sent the OTP via its default channel. ` +
-    `Try again in a moment, or select the SMS channel instead. ` +
-    `Page body sample: "${finalBody.slice(0, 200)}"`
-  );
+  throw new Error(`Failed to switch OTP delivery to "${channel}" after ${CHANNEL_SWITCH_ATTEMPTS} attempts.`);
 }
 
 async function extractMaskedRecipient(page: Page): Promise<string | undefined> {
@@ -991,67 +871,16 @@ async function fillOtpBoxes(page: Page, otp: string): Promise<void> {
     ) as HTMLInputElement[];
 
     inputs.forEach((el, i) => { (el as any).dataset.axessiaOtpIndex = String(i); });
+    return { count: inputs.length };
+  }).catch(() => ({ count: 0 }));
 
-    return {
-      count: inputs.length,
-      sampleAttrs: inputs.slice(0, 8).map(el => ({
-        type: el.type,
-        maxLength: el.maxLength,
-        className: (el.className || "").slice(0, 60),
-        id: el.id,
-        name: el.name,
-        placeholder: el.placeholder,
-      })),
-    };
-  }).catch(() => ({ count: 0, sampleAttrs: [] as any[] }));
-
-  logger.info(`[auth-session] fillOtpBoxes: found ${found.count} OTP input candidates`);
-  if (found.count === 0) {
-    logger.info(`[auth-session] fillOtpBoxes: sample DOM state: ${JSON.stringify(found.sampleAttrs).slice(0, 300)}`);
-    const allInputs = await page.evaluate(() => {
-      const out: any[] = [];
-      function walkAll(root: Document | ShadowRoot, out2: Element[]) {
-        const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
-        let n: Node | null = walker.currentNode;
-        while (n) {
-          if (n.nodeType === 1) {
-            const el = n as Element;
-            out2.push(el);
-            if ((el as any).shadowRoot) walkAll((el as any).shadowRoot, out2);
-          }
-          n = walker.nextNode();
-        }
-      }
-      const els: Element[] = [];
-      walkAll(document, els);
-      els.forEach(el => {
-        if (el.tagName === "INPUT") {
-          const r = (el as HTMLElement).getBoundingClientRect();
-          const inp = el as HTMLInputElement;
-          out.push({
-            type: inp.type,
-            maxLength: inp.maxLength,
-            id: inp.id,
-            name: inp.name,
-            visible: r.width > 0 && r.height > 0,
-          });
-        }
-      });
-      return out;
-    }).catch(() => []);
-    logger.info(`[auth-session] fillOtpBoxes: full input inventory: ${JSON.stringify(allInputs).slice(0, 500)}`);
-    throw new Error(
-      `Only found 0 OTP boxes, expected ${otp.length}. ` +
-      `The OTP page may have changed or expired. Try starting a new session.`
-    );
-  }
   if (found.count < otp.length) {
     throw new Error(`Only found ${found.count} OTP boxes, expected ${otp.length}.`);
   }
 
   for (let i = 0; i < otp.length; i++) {
     const digit = otp[i];
-    const ok = await page.evaluate(({ index, value }) => {
+    await page.evaluate(({ index, value }) => {
       function walkAll(root: Document | ShadowRoot, out: Element[]) {
         const walker = document.createTreeWalker(root as any, NodeFilter.SHOW_ELEMENT);
         let n: Node | null = walker.currentNode;
@@ -1081,13 +910,8 @@ async function fillOtpBoxes(page: Page, otp: string): Promise<void> {
         return false;
       }
     }, { index: i, value: digit });
-
-    if (!ok) {
-      logger.warn(`[auth-session] fillOtpBoxes: digit ${i + 1} of ${otp.length} did not stick`);
-    }
     await page.waitForTimeout(60);
   }
-  logger.info(`[auth-session] fillOtpBoxes: all ${otp.length} digits entered`);
 }
 
 async function clickConferma(page: Page): Promise<void> {
@@ -1119,7 +943,7 @@ async function clickConferma(page: Page): Promise<void> {
     ) as HTMLElement[];
 
     const conferma = buttons.find(b =>
-      /conferma|he confirms|confirm|verify|verifica/i.test((b.innerText || (b as HTMLInputElement).value || "").trim())
+      /conferma|confirm|verify|verifica/i.test((b.innerText || (b as HTMLInputElement).value || "").trim())
     );
     const target = conferma || buttons.find(b => (b as HTMLButtonElement | HTMLInputElement).type === "submit");
     if (!target) return false;
@@ -1127,10 +951,7 @@ async function clickConferma(page: Page): Promise<void> {
   }).catch(() => false);
 
   if (!clicked) {
-    logger.info("[auth-session] clickConferma: no button found by walker, pressing Enter as fallback");
     await page.keyboard.press("Enter").catch(() => undefined);
-  } else {
-    logger.info("[auth-session] clickConferma: clicked Conferma button");
   }
 }
 

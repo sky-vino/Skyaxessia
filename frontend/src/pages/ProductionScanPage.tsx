@@ -93,6 +93,19 @@ const OTP_LENGTH = 6;
 export default function ProductionScanPage() {
   const navigate = useNavigate();
 
+  // Ship 2g — multiple target URLs for production authenticated scans.
+  // Sky's login is redirect-based: navigate to any protected page while
+  // unauthenticated, and Sky itself redirects the browser to its login
+  // endpoint, does OTP, then redirects back. So we use targetUrls[0] as
+  // the login-trigger URL, and all URLs in the list get scanned after auth.
+  // Journey mode continues to use the separate targetUrl field.
+  const [targetUrls, setTargetUrls] = useState<string[]>([""]);
+  const addTargetUrl = () => setTargetUrls([...targetUrls, ""]);
+  const removeTargetUrl = (i: number) => setTargetUrls(targetUrls.filter((_, j) => j !== i));
+  const setTargetUrlAt = (i: number, v: string) => {
+    const u = [...targetUrls]; u[i] = v; setTargetUrls(u);
+  };
+  // Journey mode still uses a single URL field — that's the login/start page.
   const [targetUrl, setTargetUrl] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -232,8 +245,10 @@ export default function ProductionScanPage() {
       );
       return validTargets.length > 0 && targetUrl.trim().length > 8;
     }
-    return targetUrl.trim().length > 8;
-  }, [targetUrl, username, password, starting, journeyOnlyMode, targetInteractions]);
+    // URL mode: at least one non-empty target URL required.
+    const validUrls = targetUrls.map(u => u.trim()).filter(u => u.length > 8);
+    return validUrls.length > 0;
+  }, [targetUrl, targetUrls, username, password, starting, journeyOnlyMode, targetInteractions]);
 
   const otpString = otpDigits.join("");
   const canSubmitOtp = otpString.length === OTP_LENGTH && !submitting && session?.phase === "awaiting_otp";
@@ -248,16 +263,24 @@ export default function ProductionScanPage() {
         .map(t => ({ ...t, steps: t.mode === "journey" ? t.steps : [] }))
         .filter(t => t.base_page && (t.mode === "journey" ? t.steps.length > 0 : (t.selector || t.text || t.cta_text || t.href_contains)));
 
+      // Ship 2g — multi-URL: use the first target URL to trigger Sky's
+      // redirect-to-login (Sky detects no session and redirects to its own
+      // login endpoint). All URLs in cleanTargetUrls get scanned after auth
+      // via scan_options.production_target_urls.
+      const cleanTargetUrls = targetUrls.map(u => u.trim()).filter(u => u.length > 8);
+      const loginUrl = journeyOnlyMode ? targetUrl.trim() : (cleanTargetUrls[0] || "");
+
       const { data } = await authSessionApi.start({
-        target_url: targetUrl.trim(),
+        target_url: loginUrl,
         username: username.trim(),
         password,
         otp_channel: otpChannel,
         scan_name: scanName.trim() || undefined,
         scan_options: {
           ...opts,
-          // Journey mode: send targets; else send empty array.
+          // Journey mode: send targets; URL mode: send the multi-URL list.
           target_interactions: journeyOnlyMode ? journeyTargets : [],
+          production_target_urls: journeyOnlyMode ? [] : cleanTargetUrls,
           // Journey mode disables login/gestisci auto-scans (Stage parity).
           scan_post_login_landing: journeyOnlyMode ? false : opts.scan_post_login_landing,
           scan_gestisci_page: journeyOnlyMode ? false : opts.scan_gestisci_page,
@@ -412,14 +435,62 @@ export default function ProductionScanPage() {
                 onClick={() => setOpts({ ...opts, scan_entry_mode: "journey" })} />
             </div>
             {opts.scan_entry_mode === "url" && (
-              <PremiumInput
-                label="Target URL" hint="The authenticated page you want scanned (e.g. https://www.sky.it/mysky/offerte)"
-                value={targetUrl} onChange={setTargetUrl}
-                placeholder="https://www.sky.it/mysky/offerte" type="url"
-                focused={focusedField === "targeturl"}
-                onFocus={() => setFocusedField("targeturl")}
-                onBlur={() => setFocusedField(null)}
-              />
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs font-medium mb-1.5" style={{ color: "var(--muted-strong)" }}>
+                    Target URLs
+                    <span className="text-xs ml-2" style={{ color: "var(--muted)" }}>
+                      (Sky will redirect the first URL to login; after OTP, all URLs below are scanned)
+                    </span>
+                  </label>
+                  <div className="space-y-2">
+                    {targetUrls.map((url, i) => (
+                      <div key={i} className="flex gap-2">
+                        <input
+                          type="url"
+                          required
+                          placeholder={`https://www.sky.it/mysky/offerte${i > 0 ? "-page-" + (i + 1) : ""}`}
+                          value={url}
+                          onChange={e => setTargetUrlAt(i, e.target.value)}
+                          className="flex-1 rounded-lg px-3 py-2.5 text-sm outline-none transition-all"
+                          style={{
+                            background: "var(--input-bg)",
+                            border: "1px solid var(--border-strong)",
+                            color: "var(--text-strong)",
+                          }}
+                          onFocus={e => { (e.target as any).style.borderColor = "rgba(224,0,98,0.4)"; }}
+                          onBlur={e => { (e.target as any).style.borderColor = "var(--border-strong)"; }}
+                        />
+                        {targetUrls.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() => removeTargetUrl(i)}
+                            className="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-lg transition-all"
+                            style={{ color: "var(--muted)" }}
+                            onMouseEnter={e => { (e.currentTarget as any).style.color = "#ff4d6d"; (e.currentTarget as any).style.background = "rgba(255,77,109,0.1)"; }}
+                            onMouseLeave={e => { (e.currentTarget as any).style.color = "var(--muted)"; (e.currentTarget as any).style.background = "transparent"; }}
+                            title="Remove URL"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                    {targetUrls.length < 20 && (
+                      <button
+                        type="button"
+                        onClick={addTargetUrl}
+                        className="flex items-center gap-1.5 text-xs transition-colors mt-2"
+                        style={{ color: "var(--muted)" }}
+                        onMouseEnter={e => { (e.currentTarget as any).style.color = "#E00062"; }}
+                        onMouseLeave={e => { (e.currentTarget as any).style.color = "var(--muted)"; }}
+                      >
+                        <Plus size={13} /> Add URL
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
             )}
             {opts.scan_entry_mode === "journey" && (
               <>
