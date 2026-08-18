@@ -154,8 +154,11 @@ function extractScanUrls(input: StartSessionInput): string[] {
     }
   }
 
-  // Legacy: also honour any journey launch pages if configured
+  // Legacy: also honour any journey launch pages if configured.
+  // Frontend field name is `target_interactions` — old field aliases kept
+  // for compatibility with anything still writing the old shape.
   const targets =
+    input.scanOptions?.target_interactions ||
     input.authConfig?.targets ||
     input.authConfig?.journeys ||
     input.scanOptions?.journey_config?.targets ||
@@ -212,8 +215,11 @@ export async function startSession(input: StartSessionInput): Promise<AuthSessio
 
   logger.info(`[auth-session ${id}] START — targetUrl=${input.targetUrl}, channel=${otpChannel}, user=${input.username?.slice(0, 3)}***`);
 
-  // Log the journey config summary so we can see it flowing through
+  // Log the journey config summary so we can see it flowing through.
+  // Frontend sends journey targets under scanOptions.target_interactions
+  // (this is the shape the scanner reads). Old aliases kept for compat.
   const journeyTargets =
+    input.scanOptions?.target_interactions ||
     input.authConfig?.targets ||
     input.scanOptions?.journey_config?.targets ||
     input.scanOptions?.targets ||
@@ -305,7 +311,7 @@ export async function submitOtp(id: string, otp: string): Promise<AuthSessionSna
     session.phase = "authenticated";
 
     await scanQueue.add(scan.id);
-    logger.info(`[auth-session ${id}] Scan ${scan.id} queued with urls=${JSON.stringify(session.pendingScan.urls)}, journey_targets=${(session.pendingScan.authConfig?.targets || []).length}`);
+    logger.info(`[auth-session ${id}] Scan ${scan.id} queued with urls=${JSON.stringify(session.pendingScan.urls)}, journey_targets=${(session.pendingScan.scanOptions?.target_interactions || session.pendingScan.authConfig?.targets || []).length}`);
 
     await cleanupBrowser(session);
     setTimeout(() => sessions.delete(id), 60 * 1000);

@@ -258,15 +258,26 @@ export default function ProductionScanPage() {
     setStarting(true);
     setStartError(null);
     try {
-      // Ship 2f — in journey mode, only send targets that have real content.
+      // Simplified journey: two fields per target (card text + button text).
+      // Force safe backend-facing defaults on every target — the UI no longer
+      // exposes mode / click_type / href / selector / launch-scan toggles,
+      // so we lock them here so stale state can't produce surprises.
       const journeyTargets = targetInteractions
-        .map(t => ({ ...t, steps: t.mode === "journey" ? t.steps : [] }))
-        .filter(t => t.base_page && (t.mode === "journey" ? t.steps.length > 0 : (t.selector || t.text || t.cta_text || t.href_contains)));
+        .filter(t => t.base_page && (t.text || t.cta_text))  // only real content
+        .map(t => ({
+          base_page: t.base_page,
+          name: t.text || t.cta_text || "Target",
+          text: t.text,
+          cta_text: t.cta_text,
+          mode: "single-interaction" as const,
+          click_type: "any" as const,
+          selector: "",
+          href_contains: "",
+          scan_destination_only: true,   // Never scan the launch page
+          scan_launch_page: false,        // Never scan the launch page
+          steps: [],
+        }));
 
-      // Ship 2g — multi-URL: use the first target URL to trigger Sky's
-      // redirect-to-login (Sky detects no session and redirects to its own
-      // login endpoint). All URLs in cleanTargetUrls get scanned after auth
-      // via scan_options.production_target_urls.
       const cleanTargetUrls = targetUrls.map(u => u.trim()).filter(u => u.length > 8);
       const loginUrl = journeyOnlyMode ? targetUrl.trim() : (cleanTargetUrls[0] || "");
 
@@ -278,10 +289,9 @@ export default function ProductionScanPage() {
         scan_name: scanName.trim() || undefined,
         scan_options: {
           ...opts,
-          // Journey mode: send targets; URL mode: send the multi-URL list.
-          target_interactions: journeyOnlyMode ? journeyTargets : [],
+          // ALWAYS send journey targets when they exist. Mode toggle only affects UI.
+          target_interactions: journeyTargets,
           production_target_urls: journeyOnlyMode ? [] : cleanTargetUrls,
-          // Journey mode disables login/gestisci auto-scans (Stage parity).
           scan_post_login_landing: journeyOnlyMode ? false : opts.scan_post_login_landing,
           scan_gestisci_page: journeyOnlyMode ? false : opts.scan_gestisci_page,
         },
@@ -1036,14 +1046,9 @@ function TargetCard({
         </button>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <SmallLabel>Target mode</SmallLabel>
-          <select style={nativeFieldStyle} value={target.mode}
-            onChange={e => onUpdate({ mode: e.target.value as TargetInteraction["mode"] })}>
-            <option value="single-interaction">Single promo/link click</option>
-            <option value="journey">Multi-step journey</option>
-          </select>
+      <div className="rounded-lg p-3 space-y-3" style={{ background: "rgba(225,14,86,0.05)", border: "1px solid rgba(225,14,86,0.20)" }}>
+        <div className="text-[11px] text-slate-600 leading-relaxed">
+          Give the scanner two things: <strong>where to look</strong> (a card or section name on the launch page) and <strong>what to click</strong> (a button or link text inside that card). The scanner navigates to the launch page, finds the card, clicks the button, then scans the resulting page. If the button opens a modal or in-place content, that state is scanned instead.
         </div>
         <div>
           <SmallLabel>Launch page</SmallLabel>
@@ -1052,61 +1057,31 @@ function TargetCard({
             {AUTHENTICATED_PAGE_OPTIONS.map(label => <option key={label} value={label}>{label}</option>)}
           </select>
         </div>
-        <div>
-          <SmallLabel>Target / journey name</SmallLabel>
-          <input style={nativeFieldStyle} placeholder="e.g. Netflix Standard offer"
-            value={target.name} onChange={e => onUpdate({ name: e.target.value })} />
-        </div>
-        <div>
-          <SmallLabel>Click type</SmallLabel>
-          <select style={nativeFieldStyle} value={target.click_type}
-            onChange={e => onUpdate({ click_type: e.target.value as TargetInteraction["click_type"] })}>
-            <option value="button">Button / CTA</option>
-            <option value="link">Link</option>
-            <option value="heading-link">Heading/title link</option>
-            <option value="any">Any interactive element</option>
-          </select>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <SmallLabel>Card / section reference (e.g. Paramount+, Netflix Standard)</SmallLabel>
+            <input style={nativeFieldStyle} placeholder="Paramount+"
+              value={target.text} onChange={e => onUpdate({ text: e.target.value })} />
+          </div>
+          <div>
+            <SmallLabel>Button or link text to click (e.g. Scopri di più)</SmallLabel>
+            <input style={nativeFieldStyle} placeholder="Scopri di più"
+              value={target.cta_text} onChange={e => onUpdate({ cta_text: e.target.value })} />
+          </div>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <SmallLabel>Visible text / accessible name</SmallLabel>
-          <input style={nativeFieldStyle} placeholder="e.g. Netflix Standard"
-            value={target.text} onChange={e => onUpdate({ text: e.target.value })} />
-        </div>
-        <div>
-          <SmallLabel>CTA text inside card</SmallLabel>
-          <input style={nativeFieldStyle} placeholder="e.g. Scopri di piu"
-            value={target.cta_text} onChange={e => onUpdate({ cta_text: e.target.value })} />
-        </div>
-      </div>
-
-      <div>
-        <SmallLabel>Href contains</SmallLabel>
-        <input style={nativeFieldStyle} placeholder="e.g. sky-wifi or /offerte/"
-          value={target.href_contains} onChange={e => onUpdate({ href_contains: e.target.value })} />
-      </div>
-
-      <div>
-        <SmallLabel>Selector fallback</SmallLabel>
-        <textarea rows={2} style={{ ...nativeFieldStyle, minHeight: 58, resize: "vertical" }}
-          placeholder="Optional. CSS, XPath, or js= selector for the exact card/link/button."
-          value={target.selector} onChange={e => onUpdate({ selector: e.target.value })} />
-      </div>
-
-      <div className="space-y-1">
-        <PremiumToggle
-          checked={target.scan_destination_only}
-          onChange={v => onUpdate({ scan_destination_only: v })}
-          label="Use launch page only for navigation; scan the destination/final target"
-        />
-        <PremiumToggle
-          checked={target.scan_launch_page}
-          onChange={v => onUpdate({ scan_launch_page: v })}
-          label="Also scan the launch page before executing this target"
-        />
-      </div>
+      {/* Everything below is intentionally NOT in the UI. Kept in state with
+          safe defaults so the payload shape stays consistent with the backend:
+            mode = "single-interaction"    (always)
+            click_type = "any"             (any interactive element)
+            href_contains = ""             (unused)
+            selector = ""                  (no fallback)
+            name = target.text             (auto-derived)
+            scan_destination_only = true   (never scan launch page)
+            scan_launch_page = false       (never scan launch page)
+          Users don't need to see or set these for the simple case: click a
+          button inside a card, scan the result. */}
 
       {target.mode === "journey" && (
         <div className="rounded-lg p-3 space-y-3"

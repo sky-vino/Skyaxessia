@@ -390,44 +390,31 @@ export default function NewScanPage() {
                       </div>
                       <div>
                         <label className="block text-xs text-slate-500 mb-1.5">Target / journey name</label>
-                        <input style={inputStyle} placeholder="e.g. Netflix Standard offer"
+                        <input style={inputStyle} placeholder="e.g. Paramount+ offer"
                           value={target.name} onChange={e => updateTargetInteraction(index, { name: e.target.value })} />
                       </div>
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Click type</label>
-                        <select style={inputStyle} value={target.click_type} onChange={e => updateTargetInteraction(index, { click_type: e.target.value as TargetInteraction["click_type"] })}>
-                          <option value="button">Button / CTA</option>
-                          <option value="link">Link</option>
-                          <option value="heading-link">Heading/title link</option>
-                          <option value="any">Any interactive element</option>
-                        </select>
+                    </div>
+
+                    {/* Primary fields — this is what the user actually needs to fill.
+                        Click type / href / selector removed entirely per feedback. */}
+                    <div className="rounded-lg p-3 space-y-3" style={{ background: "rgba(225,14,86,0.04)", border: "1px solid rgba(225,14,86,0.15)" }}>
+                      <div className="text-[11px] text-slate-500 leading-relaxed">
+                        Two fields, one click. The scanner navigates to the launch page, finds the card whose headline matches, and clicks the button inside it. If the card is hidden behind a tab, the scanner clicks the tab first automatically.
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs text-slate-400 mb-1.5">Card headline <span className="text-slate-600">(e.g. Paramount+, Netflix Standard)</span></label>
+                          <input style={inputStyle} placeholder="Potenzia la tua visione"
+                            value={target.text} onChange={e => updateTargetInteraction(index, { text: e.target.value })} />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-slate-400 mb-1.5">Button text to click <span className="text-slate-600">(e.g. Scopri di più)</span></label>
+                          <input style={inputStyle} placeholder="Scopri di più"
+                            value={target.cta_text} onChange={e => updateTargetInteraction(index, { cta_text: e.target.value })} />
+                        </div>
                       </div>
                     </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Visible text / accessible name</label>
-                        <input style={inputStyle} placeholder="e.g. Netflix Standard"
-                          value={target.text} onChange={e => updateTargetInteraction(index, { text: e.target.value })} />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">CTA text inside card</label>
-                        <input style={inputStyle} placeholder="e.g. Scopri di piu"
-                          value={target.cta_text} onChange={e => updateTargetInteraction(index, { cta_text: e.target.value })} />
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Href contains</label>
-                        <input style={inputStyle} placeholder="e.g. sky-wifi or /offerte/"
-                          value={target.href_contains} onChange={e => updateTargetInteraction(index, { href_contains: e.target.value })} />
-                      </div>
-                    </div>
-                    <div>
-                      <label className="block text-xs text-slate-500 mb-1.5">Selector fallback</label>
-                      <textarea rows={2} style={{ ...inputStyle, minHeight: 58, resize: "vertical" }}
-                        placeholder={"Optional. CSS, XPath, or js= selector for the exact card/link/button."}
-                        value={target.selector} onChange={e => updateTargetInteraction(index, { selector: e.target.value })} />
-                    </div>
+
                     <div className="grid grid-cols-1 gap-2">
                       <Toggle checked={target.scan_destination_only}
                         onChange={v => updateTargetInteraction(index, { scan_destination_only: v })}

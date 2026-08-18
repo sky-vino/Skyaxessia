@@ -31,7 +31,7 @@ export interface ScanIssue {
   phase?: string;
   affectedCount?: number;
   /**
-   * Ship 2 / Item 5 — URL-independent grouping key for landmark-scoped issues
+   * Ship 2 / Item 5 - URL-independent grouping key for landmark-scoped issues
    * (banner / contentinfo / navigation / main / complementary / region /
    * search / form). Populated by scanner post-processing. The scan detail
    * endpoint aggregates issues sharing this key across URLs so cross-page
@@ -149,6 +149,39 @@ export interface ExtensionSessionCookie {
   sameSite?: "Lax" | "Strict" | "None";
 }
 
+/**
+ * Multi-contract account handler. Optional block on auth_config.
+ *
+ * When set, the scanner runs the picker-selection step between
+ * successful login and any target-URL navigation. Detection is
+ * DOM-heuristic (no picker_url required) and matching is
+ * label-based (so stage contract numbers != production contract
+ * numbers doesn't break the config).
+ *
+ * Empty / absent = skip entirely. Stage scans that don't need
+ * contract selection just leave this off; nothing changes.
+ */
+export interface ContractSelectorAuthConfig {
+  /**
+   * Case-insensitive substring the radio's visible label must
+   * contain (e.g. "Wifi + TV", "Contratto TV"). Robust across
+   * environments because it doesn't depend on the contract
+   * number, which differs between stage and prod.
+   */
+  label_contains?: string;
+  /**
+   * Optional exact contract-id substring, e.g. "10600970".
+   * Takes priority over label_contains when both are set and
+   * both match. Best used to pin one specific prod contract
+   * when there are multiple with similar labels.
+   */
+  contract_id?: string;
+  /** Max wait (ms) to detect the picker. Default 6000. */
+  detection_timeout_ms?: number;
+  /** Max wait (ms) for the post-Conferma redirect. Default 15000. */
+  confirm_timeout_ms?: number;
+}
+
 export interface ScanOptions {
   run_axe?: boolean;
   run_heuristics?: boolean;
@@ -164,14 +197,14 @@ export interface ScanOptions {
   run_reflow?: boolean;
   capture_screenshots?: boolean;
   /**
-   * Ship 1 / Item 4 — WCAG zoom target.
+   * Ship 1 / Item 4 - WCAG zoom target.
    * 400 (WCAG 1.4.10 default) tests both 200%/300% intermediate breakpoints AND the 320px reflow (400% equivalent).
    * 200 skips the 320px reflow test and only reports 200% intermediate-breakpoint failures.
    * Defaults to 200 to match this team's audit scenario.
    */
   zoom_target_percent?: 200 | 400;
   /**
-   * Ship 1 / Item 7 — When true, advisory / best-practice rules
+   * Ship 1 / Item 7 - When true, advisory / best-practice rules
    * (target-size-enhanced, fixed-font-size, text-truncation,
    *  complex-background, motion, gesture-no-alternative) are dropped
    * from scan output entirely instead of being downgraded to the
@@ -188,7 +221,7 @@ export interface ScanOptions {
   scan_entry_mode?: "url" | "journey";
   /** When true, after login the scanner BFS-discovers links from each seed URL and scans up to crawl_max_pages per seed. */
   crawl_mode?: boolean;
-  /** Max link hops from the seed URL (0 = seed only, 1 = seed + direct links, …). Capped at 10. */
+  /** Max link hops from the seed URL (0 = seed only, 1 = seed + direct links, ...). Capped at 10. */
   crawl_depth?: number;
   /** If true (default), only enqueue URLs on the same hostname as the seed. */
   crawl_same_domain?: boolean;
@@ -196,7 +229,7 @@ export interface ScanOptions {
   crawl_include_patterns?: string[];
   /** URLs matching any of these patterns are skipped. */
   crawl_exclude_patterns?: string[];
-  /** Hard cap on distinct pages scanned per seed URL when crawl_mode is on (1–200). */
+  /** Hard cap on distinct pages scanned per seed URL when crawl_mode is on (1-200). */
   crawl_max_pages?: number;
   /** When auth is configured, scan the public login URL before starting the authenticated session. */
   scan_login_page?: boolean;

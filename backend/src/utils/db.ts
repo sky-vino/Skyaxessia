@@ -12,6 +12,7 @@ const jsonColumns = new Set([
   "navigated_urls",
   "scan_options",
   "auth_config",
+  "mobile_config",
   "selectors",
   "depths",
   "wcag_criteria",
@@ -98,6 +99,7 @@ class SqlitePool {
     await this.connection.exec(schema);
     await this.ensureIssueEvidenceColumns();
     await this.ensureScanNavigationColumns();
+    await this.ensureAndroidColumns();
     await this.ensureAuditEventsTable();
     await this.ensureWcagGovernanceTables();
     await this.ensureDefaultAdmin();
@@ -123,12 +125,41 @@ class SqlitePool {
     if (!existing.has("evidence_explanation")) {
       await this.connection!.exec("ALTER TABLE issues ADD COLUMN evidence_explanation TEXT;");
     }
-    // Ship 2 / Item 5 — landmark_group_key enables cross-URL grouping of
-    // landmark-scoped issues. Nullable — non-landmark issues leave it NULL
-    // and behave exactly as before.
     if (!existing.has("landmark_group_key")) {
       await this.connection!.exec("ALTER TABLE issues ADD COLUMN landmark_group_key TEXT;");
     }
+  }
+
+  /**
+   * Adds the platform + mobile_config columns to the scans table if they
+   * don't already exist. This fixes:
+   *   "SQLITE_ERROR: table scans has no column named platform"
+   * when running against a fresh database that was created before these
+   * columns were part of init.sqlite.sql.
+   *
+   * Idempotent — safe to run on any state of the database.
+   */
+  private async ensureAndroidColumns(): Promise<void> {
+    const columns = await this.connection!.all("PRAGMA table_info(scans)");
+    const existing = new Set(columns.map((column: any) => column.name));
+
+    if (!existing.has("platform")) {
+      await this.connection!.exec(
+        "ALTER TABLE scans ADD COLUMN platform TEXT NOT NULL DEFAULT 'web';"
+      );
+      logger.info("Added scans.platform column (default 'web').");
+    }
+
+    if (!existing.has("mobile_config")) {
+      await this.connection!.exec(
+        "ALTER TABLE scans ADD COLUMN mobile_config TEXT;"
+      );
+      logger.info("Added scans.mobile_config column.");
+    }
+
+    await this.connection!.exec(
+      "CREATE INDEX IF NOT EXISTS idx_scans_platform ON scans(platform);"
+    );
   }
 
   private async ensureAuditEventsTable(): Promise<void> {
@@ -240,35 +271,27 @@ class SqlitePool {
   }
 
   private async ensureDefaultAdmin(): Promise<void> {
-    // Tier 3 fix — production must not silently seed a hardcoded password.
-    // Behaviour:
-    //   - If DEFAULT_ADMIN_PASSWORD is set, use it (any env).
-    //   - Else in production: throw at startup so ops must configure it.
-    //   - Else in dev/test: warn loudly and use the fallback so local runs work.
     const email = process.env.DEFAULT_ADMIN_EMAIL || "admin@accessibility.local";
     const envPassword = process.env.DEFAULT_ADMIN_PASSWORD;
     const isProd = process.env.NODE_ENV === "production";
 
     if (!envPassword && isProd) {
-      const err = new Error(
+      throw new Error(
         "SECURITY: DEFAULT_ADMIN_PASSWORD is not set and NODE_ENV=production. " +
         "Refusing to seed a hardcoded admin password in production. " +
         "Set DEFAULT_ADMIN_PASSWORD (and DEFAULT_ADMIN_EMAIL) via Azure App Settings " +
         "or Key Vault reference, then restart."
       );
-      throw err;
     }
 
     const password = envPassword || "Admin@123";
     if (!envPassword) {
-      // Loud dev warning — never appears in production because we threw above.
-      // Use console.warn so it survives even if the logger is misconfigured.
       // eslint-disable-next-line no-console
       console.warn(
         "\n============================================================\n" +
-        "  ⚠  Seeding admin with the DEFAULT PASSWORD 'Admin@123'.\n" +
-        "     This is acceptable ONLY for local development.\n" +
-        "     Set DEFAULT_ADMIN_PASSWORD before deploying anywhere.\n" +
+        "  WARNING  Seeding admin with the DEFAULT PASSWORD 'Admin@123'.\n" +
+        "           This is acceptable ONLY for local development.\n" +
+        "           Set DEFAULT_ADMIN_PASSWORD before deploying anywhere.\n" +
         "============================================================\n"
       );
     }
@@ -287,19 +310,14 @@ class SqlitePool {
   }
 
   private async ensureDefaultUsers(): Promise<void> {
-    // Tier 3 fix — the previous version unconditionally seeded user1-user5
-    // with the hardcoded password "Accessibility" on every boot, including
-    // production. Now: skip entirely unless SEED_DEMO_USERS=true is explicitly
-    // set. Dev default is skip too — set the env var when you actually want
-    // demo accounts.
     if (process.env.SEED_DEMO_USERS !== "true") {
       return;
     }
     // eslint-disable-next-line no-console
     console.warn(
       "\n============================================================\n" +
-      "  ⚠  Seeding demo users user1..user5 with password 'Accessibility'.\n" +
-      "     SEED_DEMO_USERS=true was explicitly set. Only use this in dev.\n" +
+      "  WARNING  Seeding demo users user1..user5 with password 'Accessibility'.\n" +
+      "           SEED_DEMO_USERS=true was explicitly set. Only use this in dev.\n" +
       "============================================================\n"
     );
     const password = "Accessibility";
