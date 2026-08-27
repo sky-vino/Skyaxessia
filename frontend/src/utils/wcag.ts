@@ -86,7 +86,7 @@ export function levelColor(level: WcagLevel): string {
   return LEVEL_COLORS[level] || LEVEL_COLORS["Needs Review"];
 }
 
-function primaryComplianceLevel(issue: any): WcagLevel {
+export function primaryComplianceLevel(issue: any): WcagLevel {
   const levels = getIssueComplianceLevels(issue);
   if (levels.includes("A")) return "A";
   if (levels.includes("AA")) return "AA";

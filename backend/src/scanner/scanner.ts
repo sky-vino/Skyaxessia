@@ -448,23 +448,20 @@ export class AccessibilityScanner {
     this.allIssues = this.prioritizeIssues(this.calibrateIssues(this.deduplicateIssues(this.allIssues)));
     this.generateTestCases();
     this.generateManualHybridReviewCases();
-    // ROUND 5k — Primary score is now WCAG A+AA conformance %.
-    // Compute BOTH numbers, use conformance % as `score`. The weighted
-    // Evinced-style number stays on the conformance bundle as
-    // `engineering_score` — visible in the Score Methodology section as
-    // a secondary "engineering priority" number for prioritizing fixes,
-    // but it's not the top-line score anymore. This matches EAA /
-    // EN 301 549 / Section 508 conformance reporting, and matches how
-    // Capgemini reports their MSA / WSC / AOL / DS / VA / Assistenza
-    // numbers.
+    // ROUND 5v — Primary score is now the Evinced-style weighted score.
+    // Simple formula: Σ(count × severity_weight × level_weight) / pages,
+    // subtracted from 100. Matches the PDF report's "How the score is
+    // calculated" section. Conformance % is still computed and available
+    // in the conformance bundle for reference, but is no longer the
+    // top-line score.
     const conformanceBundle = this.computeConformanceBreakdown();
-    const engineeringScore = this.computeScore(this.allIssues);
-    // conformance.overall_A_AA.pct is the plain 0-100 percentage number
-    const conformancePct = conformanceBundle.conformance?.overall_A_AA?.pct ?? engineeringScore;
-    const score = Math.round(conformancePct);
+    const evincedScore = this.computeScore(this.allIssues);
+    // Keep conformancePct for reference / potential display, but it's not the primary score.
+    const conformancePct = conformanceBundle.conformance?.overall_A_AA?.pct ?? 100;
+    const score = evincedScore;
     logger.info(`Scan navigation trail (${this.navigatedUrls.length} URL${this.navigatedUrls.length === 1 ? "" : "s"}): ${this.navigatedUrls.join(" -> ") || "none recorded"}`);
-    logger.info(`Scan complete: ${this.allIssues.length} issues. Primary score (WCAG A+AA conformance) = ${score}%. Engineering-priority score (weighted) = ${engineeringScore}.`);
-    return { issues: this.allIssues, testCases: this.testCases, domSnapshots: this.domSnapshots, navigatedUrls: this.navigatedUrls, score, conformance: { conformance: conformanceBundle.conformance, failed_criteria: conformanceBundle.failed_criteria, contributors: conformanceBundle.contributors, formula: conformanceBundle.formula, engineering_score: engineeringScore } };
+    logger.info(`Scan complete: ${this.allIssues.length} issues. Score (Evinced-weighted) = ${score}/100. WCAG A+AA conformance (reference only) = ${conformancePct}%.`);
+    return { issues: this.allIssues, testCases: this.testCases, domSnapshots: this.domSnapshots, navigatedUrls: this.navigatedUrls, score, conformance: { conformance: conformanceBundle.conformance, failed_criteria: conformanceBundle.failed_criteria, contributors: conformanceBundle.contributors, formula: conformanceBundle.formula, engineering_score: evincedScore } };
   }
 
   private async createBrowserContext(browser: any, opts: ScanOptions): Promise<any> {
@@ -4613,30 +4610,45 @@ export class AccessibilityScanner {
   // Additionally exposes computeConformanceBreakdown() for the report layer:
   // per-level (A/AA/AAA) applicable vs failed counts, matching how
   // conformance is normally reported to auditors and regulators.
+  // ROUND 5v — Evinced-style score. Simple, transparent formula matching
+  // the PDF report's "How the score is calculated" section:
+  //
+  //   weighted_sum = Σ (defect_count × severity_weight × level_weight)
+  //   perPage      = weighted_sum / distinct_pages_with_defects
+  //   score        = clamp(0, 100, 100 − perPage)
+  //
+  // Weights (classic Evinced/Deque-style):
+  //   Severity: Critical=3.0, Serious=1.9, Moderate=0.85, Minor=0.15
+  //   Level:    A=1.00, AA=0.75, AAA=0.50, unknown=0.50
+  //
+  // This replaces the earlier "asymptotic capacity" formula
+  // (100 × capacity / (capacity + impact)) which was too generous and
+  // hid real defects behind large capacity numbers. The new formula
+  // directly penalises defects proportional to their severity and level,
+  // and both the summary UI and PDF report use the same numbers.
   private computeScore(issues: ScanIssue[]): number {
     if (!issues.length) return 100;
 
     const severityWeight: Record<string, number> = {
-      critical: 10, serious: 7, moderate: 4, minor: 1,
+      critical: 3.0, serious: 1.9, moderate: 0.85, minor: 0.15,
     };
-    const levelMultiplier = { A: 1.5, AA: 1.2, AAA: 0.6, unknown: 1.0 } as const;
-    const FAILURE_PENALTY = 2;
+    const levelWeight: Record<string, number> = {
+      A: 1.00, AA: 0.75, AAA: 0.50, unknown: 0.50,
+    };
 
-    const urls = new Set(issues.map(i => i.url)).size || 1;
-
-    const failedWeightSum = issues.reduce((acc, issue) => {
-      const sevW = severityWeight[issue.severity] || 3;
+    let weightedSum = 0;
+    for (const issue of issues) {
+      const sev = String(issue.severity || "minor").toLowerCase();
       const level = this.wcagLevelForIssue(issue);
-      const lvlM = levelMultiplier[level];
-      const affected = Math.max(issue.affectedCount || issue.selectors?.length || 1, 1);
-      const scale = 1 + Math.min(Math.log2(affected), 6) * 0.25;
-      return acc + sevW * lvlM * scale;
-    }, 0);
+      const sw = severityWeight[sev] ?? 0.5;
+      const lw = levelWeight[level] ?? 0.5;
+      weightedSum += sw * lw;
+    }
 
-    const capacity = 250 * Math.sqrt(urls);
-    const impact = failedWeightSum * FAILURE_PENALTY;
-    const score = 100 * capacity / (capacity + impact);
-    return Math.max(1, Math.min(100, Math.round(score)));
+    const pages = new Set(issues.map(i => i.url).filter(Boolean)).size || 1;
+    const perPage = weightedSum / pages;
+    const score = 100 - perPage;
+    return Math.max(0, Math.min(100, Math.round(score)));
   }
 
   // ROUND 5i — Conformance breakdown used by the report layer.

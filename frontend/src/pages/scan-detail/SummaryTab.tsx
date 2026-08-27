@@ -7,7 +7,7 @@ import {
   Cell, PieChart, Pie
 } from "recharts";
 import { AlertTriangle, CheckCircle2, Clock, TrendingUp, Shield, Zap } from "lucide-react";
-import { summarizeCompliance } from "../../utils/wcag";
+import { summarizeCompliance, primaryComplianceLevel } from "../../utils/wcag";
 import { format } from "date-fns";
 
 const SEV_CONFIG = [
@@ -77,29 +77,48 @@ export default function SummaryTab({ scan }: { scan: any }) {
 
   const complianceBreakdown = useMemo(() => summarizeCompliance(issues), [issues]);
 
-  // ROUND 5t — Recompute Accessibility Score from live issue data.
-  // Previously we read `scan.score` from the DB, which for scans created
-  // with older scanner builds contained a stale number (e.g., 100 even
-  // when the compliance breakdown clearly showed Level A + AA failures).
-  // The frontend already computes complianceBreakdown correctly; use the
-  // same numbers to derive the score with the exact WCAG A+AA conformance
-  // formula the scanner would use (32 Level A + 25 Level AA criteria in
-  // the applicable set — matches AccessibilityScanner.WCAG_CRITERION_LEVELS).
-  // Falls back to scan.score if issues haven't loaded yet.
-  const APPLICABLE_A = 32;
-  const APPLICABLE_AA = 25;
+  // ROUND 5v — Recompute Accessibility Score from live issue data using the
+  // EVINCED-STYLE weighted formula that matches the PDF report:
+  //
+  //   Score = MAX(0, MIN(100, 100 − Σ(sev_weight × level_weight) / pages))
+  //
+  // Weights (classic Evinced/Deque-style):
+  //   Severity: Critical=3.0, Serious=1.9, Moderate=0.85, Minor=0.15
+  //   Level:    A=1.00, AA=0.75, AAA=0.50, unknown/advisory/needs review=0.50
+  //
+  // This replaces Round 5t's WCAG A+AA conformance formula. Now the Summary
+  // tab and PDF report show the SAME number. Old scans stored a different
+  // score in the DB — this recompute makes them show the right Evinced
+  // score in the UI without needing a rerun. Falls back to scan.score if
+  // no issue data is available.
   const completed = scan.status === "completed";
   const score = useMemo(() => {
     if (!completed) return scan.score ?? 0;
     if (!issues.length) return scan.score ?? 0;
-    const levelA = complianceBreakdown.find(b => b.level === "A");
-    const levelAA = complianceBreakdown.find(b => b.level === "AA");
-    const failedACriteria = Math.min(levelA?.criteria ?? 0, APPLICABLE_A);
-    const failedAACriteria = Math.min(levelAA?.criteria ?? 0, APPLICABLE_AA);
-    const totalApplicable = APPLICABLE_A + APPLICABLE_AA;
-    const totalPassed = (APPLICABLE_A - failedACriteria) + (APPLICABLE_AA - failedAACriteria);
-    return Math.round((totalPassed / totalApplicable) * 100);
-  }, [completed, issues.length, complianceBreakdown, scan.score]);
+
+    const SEVERITY_WEIGHT: Record<string, number> = {
+      critical: 3.0, serious: 1.9, moderate: 0.85, minor: 0.15,
+    };
+    const LEVEL_WEIGHT: Record<string, number> = {
+      A: 1.00, AA: 0.75, AAA: 0.50,
+      // Advisory / Needs review get the "unknown" weight
+      "Advisory Checks": 0.50, "Needs Review": 0.50, unknown: 0.50,
+    };
+
+    let weightedSum = 0;
+    for (const issue of issues) {
+      const sev = String(issue.severity || "minor").toLowerCase();
+      const level = primaryComplianceLevel(issue);
+      const sw = SEVERITY_WEIGHT[sev] ?? 0.5;
+      const lw = LEVEL_WEIGHT[level] ?? 0.5;
+      weightedSum += sw * lw;
+    }
+
+    const pages = new Set(issues.map((i: any) => i.url).filter(Boolean)).size || 1;
+    const perPage = weightedSum / pages;
+    const raw = 100 - perPage;
+    return Math.max(0, Math.min(100, Math.round(raw)));
+  }, [completed, issues, scan.score]);
 
   const statCards = [
     { label: "Total Issues", value: filteredIssuesTotal, icon: AlertTriangle, color: "#ff9f43" },
