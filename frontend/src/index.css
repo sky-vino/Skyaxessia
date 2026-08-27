@@ -7,10 +7,12 @@
 
   :root,
   :root[data-theme="dark"] {
+    /* Surfaces — kept dark for long-session eye comfort, warmed slightly for Sky feel */
     --bg: #17151f;
     --surface-1: #201d2b;
     --surface-2: #262238;
     --surface-3: #302a46;
+
     --text: #eceaf4;
     --text-strong: #fbfaff;
     --muted: #9b95ad;
@@ -19,37 +21,82 @@
     --border-strong: rgba(223, 218, 240, 0.24);
     --input-bg: #191723;
     --soft: rgba(223, 218, 240, 0.06);
-    --brand-blue: #6e56cf;
-    --brand-blue-strong: #5b4bc4;
-    --sky-pink: #e00062;
-    --sky-purple: #8b2bd9;
-    --sky-blue: #1677ff;
-    --sky-gradient: linear-gradient(100deg, #e00062 0%, #b018d8 48%, #1677ff 100%);
-    --brand-teal: #0f766e;
-    --brand-teal-strong: #0b5f59;
+
+    /* ---------- Sky brand palette (matches the official Sky logo gradient) ---------- */
+    --sky-orange: #FF6B00;      /* top-left of the S */
+    --sky-coral:  #FF3B7F;      /* bottom of the S */
+    --sky-pink:   #E00062;      /* K center — primary brand pink */
+    --sky-magenta:#D6008C;      /* K/y transition */
+    --sky-purple: #A855F7;      /* mid gradient */
+    --sky-blue:   #3B82F6;      /* Y bottom-right */
+    --sky-deep-blue: #1E40AF;   /* darker blue for depth */
+
+    /* The signature Sky gradient — from the logo */
+    --sky-gradient: linear-gradient(100deg,
+      #FF6B00 0%,
+      #FF3B7F 22%,
+      #E00062 45%,
+      #A855F7 72%,
+      #3B82F6 100%);
+
+    /* Simpler two-stop gradients for buttons that need less visual weight */
+    --sky-gradient-warm: linear-gradient(135deg, #FF6B00 0%, #E00062 100%);
+    --sky-gradient-cool: linear-gradient(135deg, #E00062 0%, #3B82F6 100%);
+
+    /* Legacy tokens kept for backwards compatibility — old teal/blue mappings
+       redirected to Sky palette so existing components inherit the new brand */
+    --brand-blue: var(--sky-purple);
+    --brand-blue-strong: var(--sky-pink);
+    --brand-teal: var(--sky-pink);
+    --brand-teal-strong: var(--sky-magenta);
+
+    /* Accent — used by focus rings, primary link colours */
+    --accent: var(--sky-pink);
+    --accent-strong: var(--sky-magenta);
+    --accent-glow: rgba(224, 0, 98, 0.35);
+    --accent-soft: rgba(224, 0, 98, 0.10);
   }
 
   :root[data-theme="light"] {
-    --bg: #f4f1fb;
-    --surface-1: #fbfaff;
-    --surface-2: #ede8f7;
-    --surface-3: #ded6ef;
-    --text: #342f46;
-    --text-strong: #191525;
+    --bg: #f8f6fb;
+    --surface-1: #ffffff;
+    --surface-2: #f2edf9;
+    --surface-3: #e6deef;
+    --text: #2d2440;
+    --text-strong: #14082a;
     --muted: #6f6780;
     --muted-strong: #4c455e;
-    --border: rgba(55, 47, 80, 0.16);
-    --border-strong: rgba(55, 47, 80, 0.28);
-    --input-bg: #fffefe;
-    --soft: rgba(110, 86, 207, 0.07);
-    --brand-blue: #6e56cf;
-    --brand-blue-strong: #5b4bc4;
-    --sky-pink: #e00062;
-    --sky-purple: #8b2bd9;
-    --sky-blue: #1677ff;
-    --sky-gradient: linear-gradient(100deg, #e00062 0%, #b018d8 48%, #1677ff 100%);
-    --brand-teal: #0f766e;
-    --brand-teal-strong: #0b5f59;
+    --border: rgba(55, 47, 80, 0.14);
+    --border-strong: rgba(55, 47, 80, 0.24);
+    --input-bg: #ffffff;
+    --soft: rgba(224, 0, 98, 0.05);
+
+    --sky-orange: #FF6B00;
+    --sky-coral:  #FF3B7F;
+    --sky-pink:   #E00062;
+    --sky-magenta:#D6008C;
+    --sky-purple: #A855F7;
+    --sky-blue:   #3B82F6;
+    --sky-deep-blue: #1E40AF;
+
+    --sky-gradient: linear-gradient(100deg,
+      #FF6B00 0%,
+      #FF3B7F 22%,
+      #E00062 45%,
+      #A855F7 72%,
+      #3B82F6 100%);
+    --sky-gradient-warm: linear-gradient(135deg, #FF6B00 0%, #E00062 100%);
+    --sky-gradient-cool: linear-gradient(135deg, #E00062 0%, #3B82F6 100%);
+
+    --brand-blue: var(--sky-purple);
+    --brand-blue-strong: var(--sky-pink);
+    --brand-teal: var(--sky-pink);
+    --brand-teal-strong: var(--sky-magenta);
+
+    --accent: var(--sky-pink);
+    --accent-strong: var(--sky-magenta);
+    --accent-glow: rgba(224, 0, 98, 0.28);
+    --accent-soft: rgba(224, 0, 98, 0.08);
   }
 
   html { font-size: 16px; scroll-behavior: smooth; }
@@ -57,21 +104,27 @@
   body {
     background: var(--bg);
     color: var(--text);
-    font-family: 'DM Sans', system-ui, sans-serif;
+    /* Sky Text primary. Inter falls through when Sky's CDN blocks CORS.
+       DM Sans and system fonts are further fallbacks. */
+    font-family: "Sky Text", "SkyText", "Sky Text Web", "Inter", "DM Sans",
+                 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     font-feature-settings: "ss01", "cv01";
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     margin: 0;
+    letter-spacing: -0.005em;
   }
 
   ::-webkit-scrollbar { width: 6px; height: 6px; }
   ::-webkit-scrollbar-track { background: var(--surface-1); }
   ::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: #0f766e40; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent-glow); }
 
-  ::selection { background: rgba(15, 118, 110, 0.2); color: #0f766e; }
+  ::selection { background: var(--accent-soft); color: var(--sky-pink); }
 
+  /* Focus rings — now Sky pink instead of teal, matches brand */
   *:focus-visible {
-    outline: 2px solid #0f766e;
+    outline: 2px solid var(--sky-pink);
     outline-offset: 2px;
     border-radius: 4px;
   }
@@ -84,10 +137,8 @@
     border-color: var(--border-strong) !important;
   }
 
-  select {
-    color-scheme: dark;
-  }
-
+  select { color-scheme: dark; }
+  :root[data-theme="light"] select { color-scheme: light; }
   select option {
     background: var(--surface-1);
     color: var(--text-strong);
@@ -101,21 +152,22 @@
     border: 1px solid rgba(255, 255, 255, 0.06);
   }
 
+  /* Glows now use Sky pink instead of teal */
   .glow-accent {
-    box-shadow: 0 0 20px rgba(15, 118, 110, 0.2), 0 0 40px rgba(15, 118, 110, 0.08);
+    box-shadow: 0 0 20px rgba(224, 0, 98, 0.20), 0 0 40px rgba(224, 0, 98, 0.08);
   }
-
   .glow-critical { box-shadow: 0 0 16px rgba(255, 77, 109, 0.25); }
   .glow-serious  { box-shadow: 0 0 16px rgba(255, 159, 67, 0.25); }
 
+  /* Text with the Sky gradient — for the "sky" wordmark */
   .text-gradient {
-    background: linear-gradient(135deg, #6e56cf, #8b7cf6);
+    background: var(--sky-gradient);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
   }
 
-  .border-accent { border-color: rgba(15, 118, 110, 0.3); }
+  .border-accent { border-color: rgba(224, 0, 98, 0.30); }
   .border-subtle { border-color: rgba(255, 255, 255, 0.06); }
 
   .card {
@@ -125,14 +177,13 @@
     box-shadow: 0 1px 2px rgba(25, 21, 37, 0.06);
   }
 
-  .card-hover {
-    transition: border-color 0.2s, box-shadow 0.2s;
-  }
+  .card-hover { transition: border-color 0.2s, box-shadow 0.2s; }
   .card-hover:hover {
-    border-color: rgba(15, 118, 110, 0.2);
-    box-shadow: 0 0 20px rgba(15, 118, 110, 0.05);
+    border-color: rgba(224, 0, 98, 0.28);
+    box-shadow: 0 0 20px rgba(224, 0, 98, 0.06);
   }
 
+  /* Severity — unchanged (meaningful signals, not brand colours) */
   .severity-critical { color: #ff4d6d; background: rgba(255,77,109,0.12); border-color: rgba(255,77,109,0.25); }
   .severity-serious  { color: #ff9f43; background: rgba(255,159,67,0.12); border-color: rgba(255,159,67,0.25); }
   .severity-moderate { color: #ffd60a; background: rgba(255,214,10,0.12); border-color: rgba(255,214,10,0.25); }
@@ -147,7 +198,7 @@
 .scan-line { animation: scan-line 2s linear infinite; }
 
 /* Code block */
-  .code-block {
+.code-block {
   background: var(--input-bg);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -160,43 +211,73 @@
 @layer utilities {
   .app-shell-bg {
     background:
-      linear-gradient(180deg, rgba(110, 86, 207, 0.06), transparent 34%),
+      /* Subtle Sky pink glow from top */
+      linear-gradient(180deg, rgba(224, 0, 98, 0.06), transparent 34%),
+      /* Base */
       linear-gradient(180deg, var(--bg), var(--surface-2));
   }
 
+  /* Active nav item — Sky pink text, no filled background (matches existing pattern) */
   .selected-tab-solid {
     background: transparent !important;
     color: var(--sky-pink) !important;
     border: 1px solid transparent !important;
     box-shadow: none !important;
   }
+  .selected-tab-solid * { color: var(--sky-pink) !important; }
 
-  .selected-tab-solid * {
-    color: var(--sky-pink) !important;
-  }
-
+  /* THE Sky wordmark — the "sky" text in sidebar and login,
+     rendered with the actual Sky logo gradient. This is the brand mark. */
   .sky-wordmark {
     display: inline-block;
     font-weight: 900;
-    letter-spacing: -0.055em;
-    line-height: 0.9;
+    letter-spacing: -0.06em;
+    line-height: 0.85;
+    /* Use Sky Text if available (renders the wordmark more authentically),
+       else fall through to the display font */
+    font-family: "Sky Text", "SkyText", "Inter", sans-serif;
     background: var(--sky-gradient);
     -webkit-background-clip: text;
     background-clip: text;
     -webkit-text-fill-color: transparent;
+    /* Subtle glow behind the wordmark */
+    filter: drop-shadow(0 2px 8px rgba(224, 0, 98, 0.20));
   }
 
+  /* Primary button style — Sky gradient */
   .sky-primary {
     background: var(--sky-gradient) !important;
     border-color: rgba(224, 0, 98, 0.35) !important;
     color: #fff !important;
-    box-shadow: 0 8px 20px rgba(176, 24, 216, 0.18);
+    box-shadow: 0 8px 24px rgba(176, 24, 216, 0.22);
+    transition: transform 0.05s, box-shadow 0.15s, opacity 0.15s;
+  }
+  .sky-primary:hover {
+    box-shadow: 0 10px 28px rgba(176, 24, 216, 0.30);
+    opacity: 0.96;
+  }
+  .sky-primary:active { transform: scale(0.99); }
+
+  /* Warm variant — orange to pink, for CTAs that should feel energetic */
+  .sky-primary-warm {
+    background: var(--sky-gradient-warm) !important;
+    color: #fff !important;
+    border: 0 !important;
+    box-shadow: 0 8px 20px rgba(255, 107, 0, 0.25);
+  }
+
+  /* Cool variant — pink to blue, for secondary CTAs */
+  .sky-primary-cool {
+    background: var(--sky-gradient-cool) !important;
+    color: #fff !important;
+    border: 0 !important;
+    box-shadow: 0 8px 20px rgba(59, 130, 246, 0.22);
   }
 
   .search-outline {
     background: var(--input-bg) !important;
     border: 1px solid var(--border-strong) !important;
-    box-shadow: 0 0 0 1px rgba(110, 86, 207, 0.12), 0 1px 2px rgba(25, 21, 37, 0.04);
+    box-shadow: 0 0 0 1px rgba(224, 0, 98, 0.10), 0 1px 2px rgba(25, 21, 37, 0.04);
   }
 
   .solid-section-header {
@@ -205,12 +286,23 @@
     border: 1px solid var(--border-strong) !important;
     box-shadow: none !important;
   }
+  .solid-section-header * { color: var(--text-strong) !important; }
 
-  .solid-section-header * {
-    color: var(--text-strong) !important;
+  /* Small Sky mark for inline use — 24px logo-shape square */
+  .sky-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--sky-gradient);
+    border-radius: 6px;
+    color: white;
+    font-family: "Sky Text", "Inter", sans-serif;
+    font-weight: 900;
+    box-shadow: 0 2px 8px rgba(224, 0, 98, 0.25);
   }
 }
 
+/* Light theme overrides — pink-tinted instead of teal-tinted */
 :root[data-theme="light"] .text-slate-100,
 :root[data-theme="light"] .text-slate-200,
 :root[data-theme="light"] .text-slate-300,
@@ -219,16 +311,12 @@
 :root[data-theme="light"] .text-slate-600,
 :root[data-theme="light"] .text-slate-700 { color: var(--muted-strong) !important; }
 :root[data-theme="light"] .bg-white\/\[0\.03\],
-:root[data-theme="light"] .bg-white\/\[0\.04\] { background-color: rgba(110, 86, 207, 0.06) !important; }
+:root[data-theme="light"] .bg-white\/\[0\.04\] { background-color: rgba(224, 0, 98, 0.05) !important; }
 :root[data-theme="light"] .border-white\/10 { border-color: rgba(55, 47, 80, 0.18) !important; }
 :root[data-theme="light"] input,
 :root[data-theme="light"] select,
 :root[data-theme="light"] textarea { color: var(--text-strong) !important; }
 :root[data-theme="light"] input::placeholder { color: #766d8c !important; }
-
-
-
-
 
 :root[data-theme="light"] select {
   color-scheme: light;
@@ -236,16 +324,10 @@
   color: var(--text-strong) !important;
   border: 1px solid var(--border-strong) !important;
 }
-
 :root[data-theme="light"] select option {
   background: #ffffff;
   color: var(--text-strong);
 }
-
 :root[data-theme="light"] .card {
   box-shadow: 0 1px 2px rgba(55, 47, 80, 0.08), 0 8px 24px rgba(55, 47, 80, 0.04);
 }
-
-
-
-

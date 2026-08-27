@@ -3,10 +3,38 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Accessibility — Enterprise Accessibility Platform</title>
+  <title>Axessia · Sky Accessibility Platform</title>
+
+  <!-- Sky Text webfont — served from sky.it Next.js build output.
+       NOTE: The filename hash (b34b06f299782da5) is regenerated when Sky
+       redeploys sky.it. When that happens, this URL will 404 and the
+       fallback chain (Inter) kicks in silently. For a permanent solution,
+       download this .woff2 file and self-host under /public/fonts/. -->
+  <link rel="preconnect" href="https://www.sky.it" crossorigin />
+
+  <!-- Inter as guaranteed fallback (very close visual match to Sky Text) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    /* Sky Text Regular — real URL captured from sky.it DevTools.
+       Covers the full weight range via `font-weight: 100 900` so any
+       Tailwind class (font-light through font-black) uses this file.
+       For per-weight accuracy, add more @font-face blocks once you
+       capture each individual weight's URL from sky.it Network tab. */
+    @font-face {
+      font-family: "Sky Text";
+      font-weight: 100 900;
+      font-style: normal;
+      font-display: swap;
+      src: url("https://www.sky.it/_next/static/media/b34b06f299782da5-s.p.woff2") format("woff2");
+    }
+  </style>
+
+  <!-- Sky-tinted favicon -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23FF6B00'/%3E%3Cstop offset='0.5' stop-color='%23E00062'/%3E%3Cstop offset='1' stop-color='%233B82F6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='url(%23g)'/%3E%3Ctext x='16' y='22' font-family='Inter, sans-serif' font-weight='800' font-size='18' fill='white' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E" />
+  <meta name="theme-color" content="#E00062" />
 </head>
 <body>
   <div id="root"></div>

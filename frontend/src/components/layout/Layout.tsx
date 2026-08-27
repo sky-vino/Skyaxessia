@@ -20,7 +20,7 @@ export default function Layout() {
     setTheme(theme);
   }, [theme, setTheme]);
 
-    const getScrollTarget = () => {
+  const getScrollTarget = () => {
     const root = mainRef.current;
     if (!root) return null;
 
@@ -64,23 +64,47 @@ export default function Layout() {
     ] : [])
   ];
 
+  const avatarInitial = user?.full_name?.[0]?.toUpperCase() || "?";
+
   return (
     <div className="flex h-screen overflow-hidden app-shell-bg">
       <aside
         className={`${sidebarCollapsed ? "w-20" : "w-60"} flex-shrink-0 flex flex-col transition-all duration-200`}
-        style={{ background: "var(--surface-2)", borderRight: "1px solid var(--border)", boxShadow: "12px 0 32px rgba(7,17,31,0.16)" }}
+        style={{
+          background: "var(--surface-2)",
+          borderRight: "1px solid var(--border)",
+          boxShadow: "12px 0 32px rgba(7,17,31,0.16)"
+        }}
       >
-        <div className={`flex items-center gap-2.5 ${sidebarCollapsed ? "px-3 justify-center" : "px-5"} py-5 border-b`} style={{ borderColor: "var(--border)" }}>
+        {/* Brand: Axessia + sky wordmark */}
+        <div
+          className={`flex items-center gap-2.5 ${sidebarCollapsed ? "px-3 justify-center" : "px-5"} py-5 border-b`}
+          style={{ borderColor: "var(--border)" }}
+        >
           {!sidebarCollapsed && (
             <div className="min-w-0 flex items-center gap-2.5">
-              <div className="sky-wordmark text-3xl flex-shrink-0">sky</div>
               <div className="min-w-0">
-                <div className="text-sm font-semibold leading-none truncate" style={{ color: "var(--text-strong)" }}>Axessia</div>
-                <div className="text-[10px] mt-0.5 truncate" style={{ color: "var(--muted)" }}>Accessibility Platform</div>
+                <div className="flex items-baseline gap-1.5">
+                  <div
+                    className="text-sm font-semibold leading-none truncate"
+                    style={{ color: "var(--text-strong)" }}
+                  >
+                    Axessia
+                  </div>
+                  <div className="sky-wordmark text-xl flex-shrink-0" aria-label="by Sky">sky</div>
+                </div>
+                <div
+                  className="text-[10px] mt-1 truncate"
+                  style={{ color: "var(--muted)" }}
+                >
+                  Accessibility Platform
+                </div>
               </div>
             </div>
           )}
-          {sidebarCollapsed && <div className="sky-wordmark text-2xl">sky</div>}
+          {sidebarCollapsed && (
+            <div className="sky-wordmark text-2xl" aria-label="Axessia by Sky">sky</div>
+          )}
           <button
             type="button"
             onClick={() => setSidebarCollapsed(v => !v)}
@@ -95,7 +119,10 @@ export default function Layout() {
 
         <nav className="flex-1 px-3 py-4 space-y-0.5">
           {navItems.map(({ to, icon: Icon, label, end }) => (
-            <NavLink key={to} to={to} end={end}
+            <NavLink
+              key={to}
+              to={to}
+              end={end}
               title={sidebarCollapsed ? label : undefined}
               className={({ isActive }) =>
                 `flex items-center ${sidebarCollapsed ? "justify-center px-2" : "gap-2.5 px-3"} py-2.5 rounded-lg text-sm transition-all ${
@@ -131,9 +158,16 @@ export default function Layout() {
               className={`w-full flex items-center ${sidebarCollapsed ? "justify-center px-2" : "gap-2.5 px-3"} py-2.5 rounded-lg text-sm hover:bg-white/[0.04] transition-all`}
               style={{ color: "var(--muted-strong)" }}
             >
-              <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0"
-                style={{ background: "linear-gradient(135deg, #0f766e40, #6e56cf45)", color: "#0f766e" }}>
-                {user?.full_name?.[0]?.toUpperCase()}
+              {/* User avatar — Sky gradient */}
+              <div
+                className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0"
+                style={{
+                  background: "var(--sky-gradient)",
+                  color: "white",
+                  boxShadow: "0 2px 6px rgba(224,0,98,0.20)"
+                }}
+              >
+                {avatarInitial}
               </div>
               {!sidebarCollapsed && (
                 <>
@@ -146,10 +180,14 @@ export default function Layout() {
               )}
             </button>
             {userMenuOpen && !sidebarCollapsed && (
-              <div className="absolute bottom-full left-0 right-0 mb-1 py-1 rounded-lg overflow-hidden"
-                style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
-                <button onClick={handleLogout}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-xs text-red-400 hover:bg-white/[0.04] transition-colors">
+              <div
+                className="absolute bottom-full left-0 right-0 mb-1 py-1 rounded-lg overflow-hidden"
+                style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}
+              >
+                <button
+                  onClick={handleLogout}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-xs text-red-400 hover:bg-white/[0.04] transition-colors"
+                >
                   <LogOut size={13} /> Sign out
                 </button>
               </div>
@@ -160,6 +198,7 @@ export default function Layout() {
 
       <main ref={mainRef} onScrollCapture={handleScroll} className="flex-1 overflow-y-auto relative">
         <Outlet />
+        {/* Scroll-jump FAB — Sky gradient */}
         <button
           type="button"
           onClick={handleScrollJump}

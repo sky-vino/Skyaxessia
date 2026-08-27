@@ -1,336 +1,93 @@
-# Axessia - Accessibility Testing Platform
+# Axessia — Round 5c: Silent Detour + Visible Diagnostics
 
-Enterprise WCAG accessibility scanner. Single Azure App Service container
-that hosts the React frontend and the Node.js + Express backend running
-Playwright-based scans - all under one origin.
+## Two Fixes vs Round 5b
 
-```
-+---------------------------------------------------------------------+
-|  Azure App Service - axessia-app  (Linux, Node 22 LTS, Debian 12)   |
-|                                                                     |
-|   startup.sh                                                        |
-|     +-- apt: chromium system libs                                   |
-|     +-- verify + auto-rebuild sqlite3 if GLIBC mismatch             |
-|     +-- copy Playwright browsers -> /home/playwright-browsers       |
-|     +-- ensure /home/data (SQLite)                                  |
-|     +-- node backend/dist/index.js                                  |
-|                                                                     |
-|   Express app:                                                      |
-|     /api/*    REST endpoints                                        |
-|     /ws       WebSocket (live scan progress)                        |
-|     /*        React SPA from frontend/dist                          |
-|                                                                     |
-|   Persistent storage (Azure Files at /home):                        |
-|     /home/data/accessibility.sqlite                                 |
-|     /home/playwright-browsers/                                      |
-+---------------------------------------------------------------------+
-```
+### Fix 1 — /home no longer shows as a "scanned URL" in results
 
----
+Round 5b used `navigateAndRecord()` to detour to /home, which recorded
+it as a scanned page. That's why your scan results showed both /home
+and the target URL.
 
-## Repository layout
+Round 5c uses raw `page.goto()` for the detour — pure navigation, no
+recording. Only your actual target URL appears in results.
 
-```
-.
-├── .github/workflows/main_axessia-app.yml   Build (in Debian 12 container) & deploy
-├── startup.sh                               Azure App Service startup command
-├── .gitignore
-├── .env.example
-├── README.md
-│
-├── backend/                  Node.js + TypeScript + Express
-│   ├── src/
-│   │   ├── index.ts          App entry: API, /ws, static SPA, SPA fallback
-│   │   ├── routes/           auth, scans, issues, projects, users, ...
-│   │   ├── scanner/          Playwright + axe-core + heuristics
-│   │   ├── services/         aiService (Azure OpenAI), scanQueue, reportService
-│   │   ├── middleware/       auth (JWT), error handler
-│   │   └── utils/            db (SQLite + bcryptjs), wsManager, logger
-│   ├── migrations/init.sqlite.sql
-│   ├── package.json
-│   └── tsconfig.json
-│
-└── frontend/                 React 18 + Vite + Tailwind
-    ├── src/
-    │   ├── App.tsx, main.tsx
-    │   ├── pages/            Login, Dashboard, NewScan, ScanDetail, ...
-    │   ├── components/       Layout, six tab components, UI primitives
-    │   ├── services/api.ts
-    │   ├── store/            auth (zustand), theme
-    │   └── utils/
-    ├── package.json
-    ├── tsconfig.json
-    └── vite.config.ts
-```
+### Fix 2 — Every contract-switcher event now visible in backend PowerShell log
 
----
+Round 5b called `progress()` which writes to a scan-specific progress
+channel that DOESN'T show up in the Windows PowerShell backend log.
+That's why you saw only ONE contract-switcher line
+(`Scan navigated through URL (contract-switcher detour requested)`)
+which was actually printed by `navigateAndRecord`, not my code.
 
-## Why this repo builds inside a Debian 12 container
+Round 5c introduces a local `dualLog(msg)` helper inside the switcher
+method — every event goes to BOTH the progress channel AND `logger.info`,
+so you can see the full flow in the backend PowerShell terminal.
 
-Azure App Service Linux Node 22 uses **Debian 12 (bookworm)** with **GLIBC 2.36**.
+The detour orchestration code also uses `logger.info` directly with
+diagnostic detail: what authConfig looks like, whether the /home
+navigation succeeded, whether the picker method returned normally
+or threw.
 
-The default GitHub Actions runner (`ubuntu-latest`) is **Ubuntu 24.04** with
-**GLIBC 2.39**. If you `npm install` a native module like `sqlite3` on the
-default runner and ship the resulting `.node` binary to Azure, it fails with:
+## Expected Log Output (After Restart)
+
+Run one scan with contract configured. In the backend PowerShell
+terminal you should now see:
 
 ```
-Error: /lib/x86_64-linux-gnu/libm.so.6: version `GLIBC_2.38' not found
-(required by ...sqlite3/build/Release/node_sqlite3.node)
+[contract-switcher] Production path — hasContractCfg=true, authConfig_keys=[contract_number,contract_name,...], opts_auth_config_keys=[...]
+[contract-switcher] contract configured — detouring silently to https://abbonamento.sky.it/home before target https://...
+[contract-switcher] page.goto(https://abbonamento.sky.it/home) status=200, current URL=https://abbonamento.sky.it/home
+[contract-switcher] about to call selectContractIfPickerVisible(). URL=https://abbonamento.sky.it/home
+[contract-switcher] ENTER — url=https://abbonamento.sky.it/home contract_number="10600970" contract_name="" auth_keys=[contract_number,contract_name,...]
+[contract-switcher] toggle found: "Casa QUARTUCCIU"
+[contract-switcher] toggle clicked, waiting for popover
+[contract-switcher] popover appeared
+[contract-switcher] radio matched by number "10600970", label="..."
+[contract-switcher] Conferma clicked
+[contract-switcher] popover dismissed — contract switch complete
+[contract-switcher] selectContractIfPickerVisible() returned normally
+Navigating to https://abbonamento.sky.it/offers/pdp/tv/44157?offerId=44157
 ```
 
-The workflow in this repo pins the build to `node:22-bookworm` and force-
-rebuilds sqlite3 from source, so the shipped binary works on Azure.
+If any of those lines are missing, the log will tell us exactly where
+things stop.
 
-`startup.sh` also has a runtime safety net: if sqlite3 ever fails to load,
-it installs `python3 make g++` on Azure and rebuilds sqlite3 in place, so
-the app self-heals on the next boot.
+## Failure Modes We Can Now Diagnose
 
----
+If we see `hasContractCfg=false` → authConfig doesn't have contract_number
+  → persistence layer is still broken (unlikely since log showed 58 chars,
+    but this confirms it)
 
-## Push-to-Azure - step-by-step (layman-friendly)
+If we see `hasContractCfg=true` but no `ENTER —` line → the try/catch
+  around the detour caught something. Its error message will be logged.
 
-You have three things already set up on the Azure side:
-- The Web App `axessia-app` on Linux with Node 22 LTS
-- All environment variables (`AZURE_OPENAI_*`, `JWT_*`, etc.)
-- The GitHub -> Azure OIDC connection (the three `AZUREAPPSERVICE_*` secrets
-  auto-added to your GitHub repo when you clicked *"Deploy from GitHub"*)
+If we see `ENTER — contract_number="10600970"` but no `toggle found` → the
+  DOM selector `div.contract-switch[role="button"]` doesn't match on
+  /home for the account being tested.
 
-Now, from your local machine:
+If we see `toggle found` but no `popover appeared` → click didn't fire
+  the popover (Angular event handler timing).
 
-### Step 1 - Open a terminal in this folder
+If we see `popover appeared` but no `radio matched` → contract_number
+  isn't in any radio label text.
 
-Open **Git Bash** or **PowerShell** and change into the extracted `axessia`
-folder:
-
-```bash
-cd path/to/axessia
-```
-
-### Step 2 - Verify Azure App Service settings
-
-In the Azure Portal, go to **axessia-app -> Configuration -> General settings**
-and confirm:
-
-| Setting            | Value                                        |
-| ------------------ | -------------------------------------------- |
-| Stack              | Node                                         |
-| Major version      | Node 22 LTS                                  |
-| Minor version      | Node 22 LTS                                  |
-| Startup command    | `bash /home/site/wwwroot/startup.sh`         |
-
-Then go to **axessia-app -> Environment variables** and confirm the app
-settings below exist:
-
-| Setting                          | Value                                                    |
-| -------------------------------- | -------------------------------------------------------- |
-| `WEBSITES_PORT`                  | `4000`                                                   |
-| `PORT`                           | `4000`                                                   |
-| `NODE_ENV`                       | `production`                                             |
-| `SCM_DO_BUILD_DURING_DEPLOYMENT` | `false`                                                  |
-| `ENABLE_ORYX_BUILD`              | `false`                                                  |
-| `PLAYWRIGHT_BROWSERS_PATH`       | `/home/playwright-browsers`                              |
-| `DATABASE_URL`                   | `sqlite:///home/data/accessibility.sqlite`               |
-| `STATIC_DIR`                     | `/home/site/wwwroot/frontend/dist`                       |
-| `SCAN_QUEUE_DRIVER`              | `memory`                                                 |
-| `SCAN_QUEUE_CONCURRENCY`         | `2`                                                      |
-| `JWT_SECRET`                     | (already set)                                            |
-| `JWT_REFRESH_SECRET`             | (already set)                                            |
-| `DEFAULT_ADMIN_EMAIL`            | `admin@axessia.local`                                    |
-| `DEFAULT_ADMIN_PASSWORD`         | (already set)                                            |
-| `AZURE_OPENAI_ENDPOINT`          | e.g. `https://your-resource.openai.azure.com`            |
-| `AZURE_OPENAI_KEY`               | (already set)                                            |
-| `AZURE_OPENAI_DEPLOYMENT`        | your chat model deployment name (e.g. `gpt-4o`)          |
-| `AZURE_OPENAI_API_VERSION`       | `2024-10-21`                                             |
-| `AXESSIA_ALLOWED_ORIGINS`        | `*` (or your custom domain, comma-separated)             |
-
-**Important:** `WEBSITES_PORT` should match the port your app listens on.
-Azure sets `PORT=8080` by default at container runtime. If your logs show
-`Launching backend on PORT=8080`, either set `WEBSITES_PORT=8080` or add
-`PORT=4000` as an app setting to override.
-
-### Step 3 - Initialise the local git repo (only the first time)
-
-```bash
-git init
-git add .
-git commit -m "Initial Axessia deployment"
-```
-
-### Step 4 - Connect to your GitHub repository (only the first time)
-
-Create an empty GitHub repository at
-`https://github.com/YOUR_USERNAME/YOUR_REPO_NAME` (do not add a README or
-`.gitignore` - leave it completely empty).
-
-Then, from your local terminal:
-
-```bash
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
-git push -u origin main
-```
-
-Use a [GitHub Personal Access Token](https://github.com/settings/tokens) as
-the password.
-
-### Step 5 - Watch the deploy
-
-Open your repository on github.com -> **Actions** tab. You'll see the workflow
-run. Click into it to watch each step. Total time is ~7-10 minutes on the
-first push (Playwright Chromium download + native module compile).
-
-Success indicators to look for in the log:
-- `OK: sqlite3 loaded successfully`
-- `no GLIBC lines found` (or all GLIBC deps <= 2.36)
-- `OK: production sqlite3 loads`
-
-When the workflow shows a green check, the app is live at:
-```
-https://axessia-app.azurewebsites.net
-```
-
-First HTTP request may take ~30 seconds while Azure boots the container.
-
-### Step 6 - Every subsequent update
-
-```bash
-git add .
-git commit -m "describe what you changed"
-git push
-```
-
----
-
-## Verifying the deploy
-
-Open `https://axessia-app.azurewebsites.net/api/health` - you should see:
-
-```json
-{
-  "status": "ok",
-  "name": "Axessia",
-  "version": "1.0.0",
-  "environment": "production",
-  "queue": "memory",
-  "ai_provider": "azure-openai",
-  "timestamp": "..."
-}
-```
-
-Check the live boot log at:
-```
-https://axessia-app.scm.azurewebsites.net/api/logstream
-```
-
-You should see the `[axessia-startup]` prefix lines running steps 1/6 through
-6/6, then `Axessia backend running on port 4000` (or 8080, depending on
-config).
-
----
-
-## Local development
-
-**One-time setup:**
+## Install
 
 ```powershell
-# 1. Backend environment
-cd backend
-Copy-Item ..\.env.example .\.env
-# Edit backend\.env if you want to override defaults.
-# Local dev works with the defaults below; leave Azure OpenAI blank
-# to skip AI features (scans still work, just no AI explanations).
-
-# 2. Install dependencies
-npm install
-npx playwright install chromium
-
-# 3. Start backend (runs on :4000)
-npm run dev
+Expand-Archive -Path ".\axessia_round5c.zip" `
+  -DestinationPath "C:\Users\vvn431\Downloads\axessia (1)\axessia\" -Force
 ```
 
-Wait for these three lines:
-```
-SQLite database ready at <path>\backend\data\accessibility.sqlite
-Scan queue initialized
-Axessia backend running on port 4000
-```
+**HARD RESTART BACKEND** (Ctrl+C, `npm run dev`).
 
-**In a separate terminal — frontend:**
+## After Running One Scan
+
+Send the log. Grep for `contract-switcher` and paste all matches. We'll
+know exactly what's happening for the first time in this whole thread.
+
+## Rollback
 
 ```powershell
-cd frontend
-npm install
-npm run dev
+Copy-Item -Path ".\BACKUP\scanner.ts" `
+  -Destination ".\backend\src\scanner\scanner.ts" -Force
 ```
-
-Opens `http://localhost:3000`. Default admin login:
-
-- Email: `admin@axessia.local`
-- Password: `Admin@123`
-
-**If login says "Invalid credentials":** your `backend\.env` was seeded with different values (or is missing). Delete the DB and restart:
-
-```powershell
-cd backend
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data
-Remove-Item -Force -ErrorAction SilentlyContinue *.sqlite, *.sqlite-journal
-# Confirm backend\.env has DEFAULT_ADMIN_EMAIL and DEFAULT_ADMIN_PASSWORD
-Get-Content .env | Select-String "DEFAULT_ADMIN"
-npm run dev
-```
-
-Then log in with whatever `.env` shows.
-
----
-
-
-
-```bash
-# --- Backend ---
-cd backend
-npm install
-cp ../.env.example .env
-# edit .env: set your Azure OpenAI values (or leave blank to skip AI features)
-npx playwright install chromium
-npm run dev            # runs on :4000
-
-# --- Frontend (separate terminal) ---
-cd frontend
-npm install
-npm run dev            # opens http://localhost:3000, proxies /api and /ws to :4000
-```
-
-Default login: `admin@axessia.local` / `Admin@123`.
-
----
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `GLIBC_2.38 not found` for sqlite3 | Native binary was built on Ubuntu 24.04 for GLIBC 2.39; Azure Debian 12 has 2.36 | Already fixed: workflow builds inside `node:22-bookworm` container. If it recurs, `startup.sh` auto-rebuilds sqlite3 at boot. |
-| `502 Bad Gateway` for >2 min | Container failing to start | Open Log stream in Azure. Look for `[axessia-startup]` lines. |
-| GitHub Action fails at `azure/login` | OIDC secrets missing or wrong | Re-connect Deployment Center in Azure -> GitHub. It re-creates the three `AZUREAPPSERVICE_*` GitHub secrets. |
-| Login works, scans fail with 500 | Playwright / Chromium not ready | Check `/home/playwright-browsers/` in Kudu (`/newui`). Restart the App Service to trigger a fresh install. |
-| AI explanations are the generic fallback | Azure OpenAI env vars missing or wrong deployment name | Verify `AZURE_OPENAI_DEPLOYMENT` matches the deployment name shown in Azure AI Studio. |
-| SQLite errors on save | `DATABASE_URL` pointing to a non-writable path | Must be `sqlite:///home/data/accessibility.sqlite` (three slashes total). |
-| Boot shows `Launching backend on PORT=8080` but WEBSITES_PORT=4000 | Azure sets PORT=8080 for the container; the app listens on 8080 but WEBSITES_PORT probes 4000 | Either set `WEBSITES_PORT=8080` in app settings, or set `PORT=4000` app setting to override Azure's default. |
-
----
-
-## What changed from your local repo
-
-1. `backend/src/services/aiService.ts` - rewritten for **Azure OpenAI**
-   (uses `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_KEY`, `AZURE_OPENAI_DEPLOYMENT`,
-   `AZURE_OPENAI_API_VERSION`). Falls back gracefully if env vars are missing.
-2. `backend/src/index.ts` - now serves the built React SPA under `STATIC_DIR`
-   and handles SPA deep-link fallback.
-3. `backend/src/utils/db.ts` and `backend/src/routes/auth.ts` and
-   `backend/src/routes/projects.ts` - use `bcryptjs` (pure JS) instead of
-   `bcrypt` (native), which fails to compile on Azure Linux.
-4. `startup.sh` - copies bundled Playwright browsers to `/home` on first boot,
-   AND auto-rebuilds sqlite3 from source if the shipped binary is incompatible
-   with runtime GLIBC.
-5. `.github/workflows/main_axessia-app.yml` - builds inside `node:22-bookworm`
-   (Debian 12) so native modules produce Azure-compatible binaries. Also
-   force-rebuilds sqlite3 from source as belt-and-braces.

@@ -9,20 +9,24 @@ import { chromium } from "playwright";
 export const scanRouter = Router();
 scanRouter.use(authenticate);
 
-// Web scan schema.
-const webScanSchema = z.object({
-  platform: z.literal("web").optional().default("web"),
+const createScanSchema = z.object({
   name: z.string().optional(),
   urls: z.array(z.string().url()).min(1).max(20),
   project_id: z.string().uuid().optional(),
   state_label: z.string().optional().default("default"),
   auth_config: z.object({
-    login_url: z.string().url(),
-    username_selector: z.string().trim().min(1),
-    password_selector: z.string().trim().min(1),
-    submit_selector: z.string().trim().min(1),
-    username: z.string(),
-    password: z.string(),
+    // ROUND 5r — Relaxed all these to optional. Public scans (no credentials)
+    // and "scan just the login page" flows (no username/password) both used
+    // to be blocked by the strict schema: any absent field → Zod rejection →
+    // "invalid auth" error surfaced to the user even for legitimate public
+    // scans. Scanner has always tolerated missing fields (it just skips the
+    // auth phase). The schema was the layer forcing them.
+    login_url: z.string().url().optional().or(z.literal("")).default(""),
+    username_selector: z.string().optional().default(""),
+    password_selector: z.string().optional().default(""),
+    submit_selector: z.string().optional().default(""),
+    username: z.string().optional().default(""),
+    password: z.string().optional().default(""),
     otp_from_page: z.boolean().optional(),
     otp_selector: z.string().optional(),
     otp_source_selector: z.string().optional(),
@@ -30,16 +34,12 @@ const webScanSchema = z.object({
     otp_submit_selector: z.string().optional(),
     auto_accept_cookies: z.boolean().optional().default(true),
     cookie_accept_selector: z.string().optional(),
-    profile_url: z.string().url().optional(),
+    profile_url: z.string().url().optional().or(z.literal("")),
     success_url_pattern: z.string().optional(),
     post_login_wait_ms: z.number().optional().default(2000),
-    // Multi-contract account handler - see scanner/contractSelector.ts.
-    contract_selector: z.object({
-      label_contains: z.string().trim().optional(),
-      contract_id: z.string().trim().optional(),
-      detection_timeout_ms: z.number().int().min(2000).max(30000).optional(),
-      confirm_timeout_ms: z.number().int().min(3000).max(60000).optional(),
-    }).optional(),
+    home_url: z.string().optional().default(""),
+    contract_number: z.string().optional().default(""),
+    contract_name: z.string().optional().default(""),
   }).optional(),
   scan_options: z.object({
     run_axe: z.boolean().optional().default(true),
@@ -55,8 +55,6 @@ const webScanSchema = z.object({
     run_motion: z.boolean().optional().default(true),
     run_reflow: z.boolean().optional().default(true),
     capture_screenshots: z.boolean().optional().default(true),
-    zoom_target_percent: z.union([z.literal(200), z.literal(400)]).optional(),
-    suppress_advisory_rules: z.boolean().optional(),
     scan_depth_mode: z.enum(["shallow", "standard", "exhaustive"]).optional().default("standard"),
     viewport_width: z.number().optional().default(1366),
     viewport_height: z.number().optional().default(768),
@@ -126,33 +124,6 @@ const webScanSchema = z.object({
   }).optional().default({})
 });
 
-// Android (MSA) scan schema.
-const androidScanSchema = z.object({
-  platform: z.literal("android"),
-  name: z.string().optional(),
-  project_id: z.string().uuid().optional(),
-  state_label: z.string().optional().default("default"),
-  mobile_config: z.object({
-    appPackage: z.string().trim().regex(
-      /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/,
-      "appPackage must be a dot-separated Android package name (e.g. 'it.sky.msa')"
-    ),
-    appActivity: z.string().trim().min(1).regex(
-      /^\.?[a-zA-Z][a-zA-Z0-9_.]*$/,
-      "appActivity must be an Android activity name (e.g. '.MainActivity')"
-    ),
-    apkRef: z.string().trim().optional(),
-  }),
-  scan_options: z.object({
-    capture_screenshots: z.boolean().optional().default(true),
-  }).optional().default({}),
-});
-
-const createScanSchema = z.discriminatedUnion("platform", [
-  webScanSchema.extend({ platform: z.literal("web") }),
-  androidScanSchema,
-]).or(webScanSchema);
-
 // GET /api/scans
 scanRouter.get("/", async (req: AuthRequest, res: Response): Promise<void> => {
   const page  = Number(req.query.page)  || 1;
@@ -162,14 +133,12 @@ scanRouter.get("/", async (req: AuthRequest, res: Response): Promise<void> => {
   const dateFrom = req.query.date_from as string | undefined;
   const dateTo = req.query.date_to as string | undefined;
   const nameFilter = req.query.name as string | undefined;
-  const platformFilter = req.query.platform as string | undefined;
   const params: any[] = [];
   const conditions: string[] = [];
   if (projectId) { params.push(projectId); conditions.push(`s.project_id = $${params.length}`); }
   if (dateFrom) { params.push(dateFrom); conditions.push(`DATE(s.created_at) >= DATE($${params.length})`); }
   if (dateTo) { params.push(dateTo); conditions.push(`DATE(s.created_at) <= DATE($${params.length})`); }
   if (nameFilter) { params.push(`%${nameFilter}%`); conditions.push(`LOWER(COALESCE(s.name, '')) LIKE LOWER($${params.length})`); }
-  if (platformFilter) { params.push(platformFilter); conditions.push(`s.platform = $${params.length}`); }
   const where = conditions.length ? `AND ${conditions.join(" AND ")}` : "";
   const [rows, count, completedCount, activeCount] = await Promise.all([
     db.query(
@@ -243,49 +212,12 @@ scanRouter.post("/", async (req: AuthRequest, res: Response): Promise<void> => {
     res.status(400).json({ error: "Invalid input", details: parsed.error.flatten() });
     return;
   }
-  const data = parsed.data;
-  const platform = (data as any).platform || "web";
-
-  if (platform === "android") {
-    const androidData = data as z.infer<typeof androidScanSchema>;
-    const syntheticUrl = `android://${androidData.mobile_config.appPackage}/${androidData.mobile_config.appActivity}`;
-    const result = await db.query(
-      `INSERT INTO scans (name, urls, project_id, created_by, state_label,
-                          auth_config, scan_options, platform, mobile_config, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'queued') RETURNING *`,
-      [
-        androidData.name || `Android scan ${new Date().toLocaleDateString()}`,
-        [syntheticUrl],
-        androidData.project_id || null,
-        req.user!.id,
-        androidData.state_label,
-        null,
-        JSON.stringify(androidData.scan_options || {}),
-        "android",
-        JSON.stringify(androidData.mobile_config),
-      ]
-    );
-    const scan = result.rows[0];
-    await scanQueue.add(scan.id);
-    res.status(201).json({ scan });
-    return;
-  }
-
-  const webData = data as z.infer<typeof webScanSchema>;
+  const { name, urls, project_id, state_label, auth_config, scan_options } = parsed.data;
   const result = await db.query(
-    `INSERT INTO scans (name, urls, project_id, created_by, state_label,
-                        auth_config, scan_options, platform, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued') RETURNING *`,
-    [
-      webData.name || `Scan ${new Date().toLocaleDateString()}`,
-      webData.urls,
-      webData.project_id || null,
-      req.user!.id,
-      webData.state_label,
-      webData.auth_config ? JSON.stringify(webData.auth_config) : null,
-      JSON.stringify(webData.scan_options),
-      "web",
-    ]
+    `INSERT INTO scans (name, urls, project_id, created_by, state_label, auth_config, scan_options, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'queued') RETURNING *`,
+    [name || `Scan ${new Date().toLocaleDateString()}`, urls, project_id || null,
+     req.user!.id, state_label, auth_config ? JSON.stringify(auth_config) : null, JSON.stringify(scan_options)]
   );
   const scan = result.rows[0];
   await scanQueue.add(scan.id);
@@ -311,10 +243,10 @@ scanRouter.post("/:id/rerun", async (req: AuthRequest, res: Response): Promise<v
   const sourceResult = await db.query("SELECT * FROM scans WHERE id = $1", [req.params.id]);
   const source = sourceResult.rows[0];
   if (!source) { res.status(404).json({ error: "Scan not found" }); return; }
+
   const result = await db.query(
-    `INSERT INTO scans (name, urls, project_id, created_by, state_label,
-                        auth_config, scan_options, platform, mobile_config, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'queued') RETURNING *`,
+    `INSERT INTO scans (name, urls, project_id, created_by, state_label, auth_config, scan_options, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'queued') RETURNING *`,
     [
       `Re-run: ${source.name || "Scan"}`,
       source.urls || [],
@@ -322,9 +254,7 @@ scanRouter.post("/:id/rerun", async (req: AuthRequest, res: Response): Promise<v
       req.user!.id,
       source.state_label || "default",
       source.auth_config ? JSON.stringify(source.auth_config) : null,
-      JSON.stringify(source.scan_options || {}),
-      source.platform || "web",
-      source.mobile_config ? JSON.stringify(source.mobile_config) : null,
+      JSON.stringify(source.scan_options || {})
     ]
   );
   const scan = result.rows[0];
@@ -380,6 +310,7 @@ scanRouter.patch("/:id/test-cases/:testCaseId", async (req: AuthRequest, res: Re
     res.status(400).json({ error: "Invalid status" });
     return;
   }
+
   const result = await db.query(
     "UPDATE test_cases SET status = $1 WHERE id = $2 AND scan_id = $3 RETURNING *",
     [status, req.params.testCaseId, req.params.id]
@@ -388,7 +319,7 @@ scanRouter.patch("/:id/test-cases/:testCaseId", async (req: AuthRequest, res: Re
   res.json({ test_case: result.rows[0] });
 });
 
-// GET /api/scans/:id/report
+// GET /api/scans/:id/report - interactive HTML report
 scanRouter.get("/:id/report", async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const scanId = String(req.params.id);
@@ -407,7 +338,7 @@ scanRouter.get("/:id/report", async (req: AuthRequest, res: Response): Promise<v
   }
 });
 
-// GET /api/scans/:id/screenshots
+// GET /api/scans/:id/screenshots - all base64 screenshots for download
 scanRouter.get("/:id/screenshots", async (req: AuthRequest, res: Response): Promise<void> => {
   const result = await db.query(
     `SELECT id, url, phase, screenshot, created_at FROM dom_snapshots
@@ -422,7 +353,7 @@ scanRouter.get("/:id/screenshots", async (req: AuthRequest, res: Response): Prom
   });
 });
 
-// GET /api/scans/:id/report/pdf
+// GET /api/scans/:id/report/pdf - server-rendered downloadable PDF
 scanRouter.get("/:id/report/pdf", async (req: AuthRequest, res: Response): Promise<void> => {
   let browser: any;
   try {
@@ -454,6 +385,7 @@ scanRouter.get("/:id/report/pdf", async (req: AuthRequest, res: Response): Promi
       printBackground: true,
       margin: { top: "12mm", right: "10mm", bottom: "12mm", left: "10mm" }
     });
+
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${scanName || "accessibility-report"}.pdf"`);
     res.send(pdf);

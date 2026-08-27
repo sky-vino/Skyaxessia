@@ -91,6 +91,11 @@ const PHASE_LABELS: Record<Phase, string> = {
 const OTP_LENGTH = 6;
 
 export default function ProductionScanPage() {
+  // ROUND 5k — Version marker. Console AND visible on-page ribbon.
+  if (typeof window !== "undefined" && !(window as any).__AXESSIA_5K_LOGGED_PROD) {
+    console.log("%c[AXESSIA] Production ScanPage: Round 5k installed", "color:#2563eb;font-weight:bold");
+    (window as any).__AXESSIA_5K_LOGGED_PROD = true;
+  }
   const navigate = useNavigate();
 
   // Ship 2g — multiple target URLs for production authenticated scans.
@@ -111,6 +116,13 @@ export default function ProductionScanPage() {
   const [password, setPassword] = useState("");
   const [otpChannel, setOtpChannel] = useState<"email" | "sms">("email");
   const [scanName, setScanName] = useState("");
+  const [contractNumber, setContractNumber] = useState("");
+  const [contractName, setContractName] = useState("");
+  // ROUND 5g — Home URL: deterministic landing page for auth.
+  // Sky always redirects unauthenticated users hitting /home to /login,
+  // so this fixes the intermittent "Could not find a login form" errors
+  // that happened when navigating directly to arbitrary target URLs.
+  const [homeUrl, setHomeUrl] = useState("https://abbonamento.sky.it/home");
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
 
@@ -287,6 +299,18 @@ export default function ProductionScanPage() {
         password,
         otp_channel: otpChannel,
         scan_name: scanName.trim() || undefined,
+        auth_config: {
+          // ROUND 5i — always send as strings (never undefined). Empty
+          // string = "user left blank"; missing key = "stale frontend build".
+          // Trivial diagnostics in the backend log.
+          contract_number: contractNumber.trim() || "",
+          contract_name:   contractName.trim()   || "",
+          // ROUND 5g — Home URL: auth-session navigates here first (deterministic
+          // Sky login redirect for unauthenticated users). Scanner also reads
+          // this as the /home detour URL for the contract-switcher (falls back
+          // to <origin>/home derivation if omitted).
+          home_url:        homeUrl.trim()        || "",
+        },
         scan_options: {
           ...opts,
           // ALWAYS send journey targets when they exist. Mode toggle only affects UI.
@@ -432,6 +456,55 @@ export default function ProductionScanPage() {
                 onFocus={() => setFocusedField("scanname")}
                 onBlur={() => setFocusedField(null)}
               />
+              {/* ROUND 5g — Home URL: auth-session always hits this first (deterministic
+                  Sky login redirect). Scanner also uses it as the /home detour URL for
+                  the contract-switcher. Prod default: https://abbonamento.sky.it/home */}
+              <PremiumInput
+                label="Home URL (required)"
+                value={homeUrl}
+                onChange={setHomeUrl}
+                placeholder="https://abbonamento.sky.it/home"
+                type="text"
+                focused={focusedField === "home_url"}
+                onFocus={() => setFocusedField("home_url")}
+                onBlur={() => setFocusedField(null)}
+              />
+              <div className="text-[11px] leading-relaxed -mt-2" style={{ color: "var(--muted)" }}>
+                The auth session lands here first (Sky reliably redirects unauthenticated users to <code>/login</code>). Contract switching also happens here before hitting your target URLs.
+              </div>
+              <div
+                className="rounded-xl p-4 space-y-3"
+                style={{ background: "var(--surface-1)", border: "1px solid var(--border-strong)" }}
+              >
+                <div className="text-sm font-semibold" style={{ color: "var(--text-strong)" }}>
+                  Multi-contract account
+                </div>
+                <div className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
+                  When an account has more than one contract, the site shows a "Seleziona un contratto" picker after login. Enter either the contract number (e.g. <code>10600970</code>) or the contract name (e.g. <code>Wifi + TV</code>) — or both. The number is exact; the name survives environment differences. Leave blank for single-contract accounts.
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <PremiumInput
+                    label="Contract number (optional)"
+                    value={contractNumber}
+                    onChange={setContractNumber}
+                    placeholder="e.g. 10600970"
+                    type="text"
+                    focused={focusedField === "contract_number"}
+                    onFocus={() => setFocusedField("contract_number")}
+                    onBlur={() => setFocusedField(null)}
+                  />
+                  <PremiumInput
+                    label="Contract name (optional)"
+                    value={contractName}
+                    onChange={setContractName}
+                    placeholder="e.g. Wifi + TV"
+                    type="text"
+                    focused={focusedField === "contract_name"}
+                    onFocus={() => setFocusedField("contract_name")}
+                    onBlur={() => setFocusedField(null)}
+                  />
+                </div>
+              </div>
             </div>
           </GradientCard>
 
@@ -874,8 +947,8 @@ function PremiumInput({
       <FieldLabel>{label}</FieldLabel>
       <div className="relative rounded-xl p-[1.5px] transition-all"
         style={{
-          background: focused ? "var(--sky-gradient)" : "var(--border-strong)",
-          boxShadow: focused ? "0 0 0 3px rgba(224, 0, 98, 0.10), 0 0 20px -4px rgba(139, 43, 217, 0.28)" : "none",
+          background: focused ? "var(--sky-pink)" : "var(--border-strong)",
+          boxShadow: focused ? "0 0 0 3px rgba(224, 0, 98, 0.10)" : "none",
         }}>
         <input
           type={type} value={value}
@@ -898,13 +971,10 @@ function ChannelPill({
     <button type="button" onClick={onClick}
       className="relative py-3 px-4 rounded-xl text-sm font-medium flex items-center justify-center gap-2 transition-all"
       style={{
-        background: active ? "var(--soft)" : "var(--surface-2)",
-        border: active ? "1.5px solid transparent" : "1.5px solid var(--border-strong)",
-        color: active ? "var(--text-strong)" : "var(--text)",
-        backgroundImage: active ? `linear-gradient(var(--soft), var(--soft)), var(--sky-gradient)` : undefined,
-        backgroundClip: active ? "padding-box, border-box" : undefined,
-        backgroundOrigin: active ? "padding-box, border-box" : undefined,
-        boxShadow: active ? "0 4px 20px -6px rgba(176, 24, 216, 0.28)" : "none",
+        background: active ? "rgba(224, 0, 98, 0.08)" : "var(--surface-2)",
+        border: active ? "1.5px solid var(--sky-pink)" : "1.5px solid var(--border-strong)",
+        color: active ? "var(--sky-pink)" : "var(--text)",
+        boxShadow: active ? "0 0 0 3px rgba(224, 0, 98, 0.10)" : "none",
       }}>
       {icon}
       {label}
@@ -919,14 +989,11 @@ function ChoiceCard({
     <button type="button" onClick={onClick}
       className="text-left rounded-xl p-4 transition-all relative overflow-hidden"
       style={{
-        background: active ? "var(--soft)" : "var(--surface-2)",
-        border: active ? "1.5px solid transparent" : "1.5px solid var(--border-strong)",
-        backgroundImage: active ? `linear-gradient(var(--soft), var(--soft)), var(--sky-gradient)` : undefined,
-        backgroundClip: active ? "padding-box, border-box" : undefined,
-        backgroundOrigin: active ? "padding-box, border-box" : undefined,
-        boxShadow: active ? "0 4px 20px -6px rgba(176, 24, 216, 0.22)" : "none",
+        background: active ? "rgba(224, 0, 98, 0.06)" : "var(--surface-2)",
+        border: active ? "1.5px solid var(--sky-pink)" : "1.5px solid var(--border-strong)",
+        boxShadow: active ? "0 0 0 3px rgba(224, 0, 98, 0.08)" : "none",
       }}>
-      <div className="text-sm font-semibold mb-1" style={{ color: active ? "var(--text-strong)" : "var(--text-strong)" }}>{title}</div>
+      <div className="text-sm font-semibold mb-1" style={{ color: active ? "var(--sky-pink)" : "var(--text-strong)" }}>{title}</div>
       <div className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>{subtitle}</div>
     </button>
   );

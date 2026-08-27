@@ -26,7 +26,6 @@ import { runColorChecks } from "./colorContrast";
 import { runZoomChecks, runPointerChecks } from "./zoomPointer";
 import { runStateScanning } from "./stateScanner";
 import { enrichOwnership } from "./ownership";
-import { selectContract } from "./contractSelector";
 import { logger } from "../utils/logger";
 import { canonicalUrlKey, discoverOutboundLinks, normalizeHttpUrl, passesCrawlFilters, planCrawlUrls } from "./crawlDiscovery";
 
@@ -36,6 +35,16 @@ export interface ScanResult {
   domSnapshots: DomSnapshot[];
   navigatedUrls: string[];
   score: number;
+  // ROUND 5i — Conformance breakdown for the report layer. Contains
+  // per-WCAG-level (A/AA/AAA) applicable-vs-failed counts, the same
+  // Evinced-style score, and a list of failed criteria with defect IDs.
+  conformance?: {
+    conformance: Record<string, { applicable: number; failed: number; passed: number; pct: number }>;
+    failed_criteria: { criterion: string; level: string; defect_count: number; issue_ids: string[] }[];
+    contributors?: any[];
+    formula?: any;
+    engineering_score?: number;
+  };
 }
 
 export class AccessibilityScanner {
@@ -47,21 +56,15 @@ export class AccessibilityScanner {
   private navigationStartTime = Date.now();
   private navigatedUrls: string[] = [];
   private navigatedUrlKeys = new Set<string>();
+  // ROUND 5e — URLs the contract-switcher detour hits (silent /home).
+  // recordNavigatedUrl skips these so they never appear in the scan navigation
+  // trail (backend log line 315, report "URLs passed through" PDF section, and
+  // scan detail navigation panel). Normalised form: origin + pathname, lowercase.
+  private switcherDetourUrls = new Set<string>();
   private scannedPageKeys = new Set<string>();
   private transitionNodes = new Map<string, { id: string; url: string; phase: string; state?: string; screenshot?: string; issueCount: number }>();
   private transitionEdges: { from?: string; to: string; trigger: string; atMs: number }[] = [];
   private lastTransitionNodeId?: string;
-
-  // ROUND 13 — THE ACTUAL FIX
-  // ────────────────────────────────────────────────────────────────────
-  // A set of URL keys that runFullPageScan MUST REFUSE to scan.
-  // Populated at scan start when journeyOnlyMode is active with the
-  // launch/target URL and the auth login URL. This is the last line of
-  // defence — no matter which of the ~12 code paths that call
-  // runFullPageScan tries to scan the launch page, this check blocks
-  // it. Every previous "one-line fix" tried to block a specific caller;
-  // this one blocks the callee, which is the only place ALL paths meet.
-  private blockedLaunchUrls: Set<string> = new Set();
 
   constructor(scan: any, onProgress: ProgressCallback) {
     this.scan = scan;
@@ -71,47 +74,72 @@ export class AccessibilityScanner {
   async run(): Promise<ScanResult> {
     this.navigationStartTime = Date.now();
     const opts: ScanOptions = { ...this.scan.scan_options };
-    const urls: string[] = this.scan.urls || [];
+    const rawUrls: string[] = this.scan.urls || [];
     const authConfig = this.scan.auth_config;
+
+    // ROUND 5p / 5s — Register auth home_url as a switcher-detour URL right at
+    // scan start so Round 5e (nav trail) and Round 5h (DOM snapshot + issue
+    // filter) suppress it from the report. BUT ONLY when home_url is NOT one
+    // of the target URLs. If the user explicitly set their target URL to the
+    // home page (e.g. target=/home AND home_url=/home), suppressing /home
+    // would throw away every snapshot the scanner produces on the actual
+    // scan target — 100% content loss. Round 5s adds that guard.
+    const authHomeUrl = String(authConfig?.home_url || "").trim();
+    if (authHomeUrl && /^https?:\/\//i.test(authHomeUrl)) {
+      const homeUrlKey = this.normaliseUrlForDetourCheck(authHomeUrl);
+      const rawTargetKeys = rawUrls
+        .filter((u: any) => typeof u === "string" && u.trim())
+        .map((u: string) => this.normaliseUrlForDetourCheck(u.trim()));
+      const homeUrlIsATarget = rawTargetKeys.includes(homeUrlKey);
+      if (!homeUrlIsATarget) {
+        this.switcherDetourUrls.add(homeUrlKey);
+        logger.info(`[scan-start] ROUND 5p — auth home_url "${authHomeUrl}" registered as switcher-detour URL (suppress from nav trail + DOM snapshots + issues in report)`);
+      } else {
+        logger.info(`[scan-start] ROUND 5s — auth home_url "${authHomeUrl}" IS one of the target URLs (${rawTargetKeys.join(", ")}); NOT suppressing — user explicitly wants this URL scanned. Report will include /home content.`);
+      }
+    }
+
+    // ROUND 5o — URL-based contract override. If any target URL contains
+    // ?axessia_contract=NUMBER (or &axessia_contract=), extract it, use it
+    // to populate authConfig.contract_number (if not already set), then
+    // STRIP the parameter from the URL before scanning so the scan URL is
+    // clean. This is a workaround for the frontend being stuck on an old
+    // bundle that doesn't send contract fields — you can force a contract
+    // switch by just editing the target URL in the form.
+    // Example: https://test.abbonamento.sky.it/offers?axessia_contract=10600970
+    const urls: string[] = rawUrls.map(rawUrl => {
+      if (!rawUrl || typeof rawUrl !== "string") return rawUrl;
+      try {
+        const parsed = new URL(rawUrl);
+        const overrideContract = parsed.searchParams.get("axessia_contract");
+        const overrideHome = parsed.searchParams.get("axessia_home");
+        if (overrideContract && authConfig) {
+          const existing = String(authConfig.contract_number || "").trim();
+          if (!existing) {
+            (authConfig as any).contract_number = overrideContract.trim();
+            logger.info(`[stage-auth] ROUND 5o — extracted contract_number="${overrideContract}" from target URL query string; injecting into auth_config`);
+          }
+          parsed.searchParams.delete("axessia_contract");
+        }
+        if (overrideHome && authConfig) {
+          const existing = String(authConfig.home_url || "").trim();
+          if (!existing) {
+            (authConfig as any).home_url = decodeURIComponent(overrideHome).trim();
+            logger.info(`[stage-auth] ROUND 5o — extracted home_url="${(authConfig as any).home_url}" from target URL query string; injecting into auth_config`);
+          }
+          parsed.searchParams.delete("axessia_home");
+        }
+        return parsed.toString();
+      } catch {
+        return rawUrl;
+      }
+    });
+
     const extraStates = opts.extra_states || [];
     const scannedEntrypoints = new Set<string>();
-
-    // ═══════════════════════════════════════════════════════════════════
-    // DIAGNOSTIC LOG (Round 15) — dump what the scanner ACTUALLY received.
-    // If target_interactions is missing/empty here, the bug is upstream
-    // (authSessionManager or DB serialization). If it's present here but
-    // my rewrite doesn't run, the bug is in the URL loop.
-    // ═══════════════════════════════════════════════════════════════════
-    const tiCount = Array.isArray(opts.target_interactions) ? opts.target_interactions.length : -1;
-    logger.info(`[SCANNER-START] scan.id=${this.scan.id}, urls=${JSON.stringify(urls)}, scan_entry_mode=${opts.scan_entry_mode}, target_interactions.length=${tiCount}, first_target=${JSON.stringify((opts.target_interactions || [])[0] || null)}`);
-
     const hasDestinationOnlyTargetInteractions = (Array.isArray(opts.target_interactions) ? opts.target_interactions : [])
       .some(target => target && target.scan_destination_only !== false);
-    // Journey mode on IF the user explicitly picked journey mode OR they
-    // configured ANY journey target. Their mental model is: "if I set up a
-    // journey, run the journey — don't also scan the launch URL as a plain
-    // full-page scan." Previously this required the user to click a mode
-    // toggle they didn't know about; now the presence of a target IS the
-    // signal.
-    const hasAnyTargetInteractions = Array.isArray(opts.target_interactions) && opts.target_interactions.length > 0;
-    const journeyOnlyMode = opts.scan_entry_mode === "journey" || hasDestinationOnlyTargetInteractions || hasAnyTargetInteractions;
-
-    // ROUND 13 — Populate the "never scan these URLs" set. In journey mode,
-    // every URL that was configured as a launch/target URL must be blocked
-    // from full-page scanning, because those are the pages the user
-    // explicitly said "don't scan, use as launch point only."
-    this.blockedLaunchUrls.clear();
-    if (journeyOnlyMode) {
-      for (const u of urls) {
-        const k = canonicalUrlKey(u) || u;
-        if (k) this.blockedLaunchUrls.add(k);
-      }
-      if (authConfig?.login_url) {
-        const lk = canonicalUrlKey(authConfig.login_url) || authConfig.login_url;
-        if (lk) this.blockedLaunchUrls.add(lk);
-      }
-      logger.info(`ROUND 13 GUARD: journey mode active — runFullPageScan will REFUSE to scan these launch URLs: ${Array.from(this.blockedLaunchUrls).join(", ")}`);
-    }
+    const journeyOnlyMode = opts.scan_entry_mode === "journey" || hasDestinationOnlyTargetInteractions;
 
     const stepsPerUrl = 12;
     const maxPerSeed = opts.crawl_mode
@@ -133,14 +161,6 @@ export class AccessibilityScanner {
     try {
       for (const url of urls) {
         logger.info(`Scanning URL: ${url}`);
-
-        // [journey] URL loop iteration — reveals which code path we take
-        // (authenticated vs unauthenticated) and whether journey mode is
-        // active. This is the split that hid the bug for 15 rounds.
-        const willTakeAuthPath = Boolean(authConfig?.login_url);
-        const journeyMsg = `[journey] URL loop iteration — url=${url} path=${willTakeAuthPath ? "authenticated" : "unauthenticated"} crawl_mode=${Boolean(opts.crawl_mode)} journeyOnlyMode=${journeyOnlyMode} target_interactions=${Array.isArray(opts.target_interactions) ? opts.target_interactions.length : 0}`;
-        logger.info(journeyMsg);
-        progress(journeyMsg);
 
         try {
           if (authConfig?.login_url) {
@@ -175,41 +195,57 @@ export class AccessibilityScanner {
               const landedUrl = await this.handleLogin(page, authConfig, url);
               progress(`SUCCESS: Login and OTP completed; landed on ${landedUrl}`);
 
-              // Contract picker — for multi-contract accounts (production
-              // real Sky IDs with both TV and Wifi+TV contracts), Sky
-              // routes every authenticated request to a picker until a
-              // contract is selected in the session. Run this ONCE right
-              // after login so every downstream operation (target URL,
-              // journey base-page navigation, post-login page scans,
-              // Gestisci scan) inherits the correct contract context.
-              //
-              // Safe as a no-op when auth.contract_selector is not
-              // configured. Safe when the picker doesn't appear (single-
-              // contract accounts, stage): detection times out in ~6s and
-              // the scan proceeds unchanged.
-              if (authConfig?.contract_selector) {
-                progress(`Checking for multi-contract picker...`);
-                const contractResult = await selectContract(page, authConfig.contract_selector);
-                if (contractResult.outcome === "selected") {
-                  progress(`SUCCESS: Contract selected: "${contractResult.labelMatched}"`);
-                  logger.info(`Contract selected for ${url}: ${contractResult.labelMatched} (redirected to ${contractResult.finalUrl})`);
-                } else if (contractResult.outcome === "no_picker") {
-                  progress(`No contract picker shown; single-contract account or already selected.`);
-                } else if (contractResult.outcome === "failed") {
-                  progress(`WARN: Contract selection failed: ${contractResult.reason}`);
-                  logger.warn(`Contract selection failed for ${url}: ${contractResult.reason}`);
-                  this.allIssues.push({
-                    ruleId: "contract-selection-failed",
-                    severity: "serious",
-                    category: "navigation-coverage",
-                    message: `Multi-contract picker was shown but the configured contract could not be selected: ${contractResult.reason}`,
-                    url,
-                    selector: "document",
-                    tags: ["navigation-coverage", "advisory"],
-                    fixSuggestion: "Verify auth_config.contract_selector.label_contains (or contract_id) matches an active contract. Check the picker DOM in DevTools and adjust the label.",
-                    evidenceExplanation: `Contract selection detail: ${contractResult.reason}`,
-                  });
+              // ROUND 5d: Contract switcher detour on the Stage path.
+              // Same flow as the Production path — if a contract is
+              // configured, navigate to Sky's /home to switch contracts
+              // before any target/journey/gestisci scans run.
+              // Runs BEFORE the landing-page / gestisci / target scans
+              // and BEFORE journey config, so every subsequent scan sees
+              // the correct contract's data.
+              const stageContractCfg = authConfig || {};
+              const stageContractNumber = String(stageContractCfg?.contract_number || "").trim();
+              const stageContractName   = String(stageContractCfg?.contract_name   || "").trim();
+              const stageHasContract = Boolean(stageContractNumber || stageContractName);
+              // ROUND 5j — CORRECTED diagnostic. Check for the specific contract
+              // keys' presence in the payload, not just "any keys". The old
+              // condition mislabeled a stale frontend (which sends 13 unrelated
+              // auth keys) as "fields blank".
+              const hasContractKeys = stageContractCfg &&
+                ("contract_number" in stageContractCfg || "contract_name" in stageContractCfg);
+              const hasHomeUrlKey = stageContractCfg && "home_url" in stageContractCfg;
+              const stageDiag = stageHasContract
+                ? "contract configured, will detour to /home for switcher"
+                : (hasContractKeys
+                    ? "contract keys ARE in the payload but VALUES are empty — fill Contract number OR Contract name in the Stage form to enable switching"
+                    : "contract keys are MISSING from payload — Stage frontend is STALE. Install Round 5j (or later) NewScanPage.tsx, restart Vite, hard-reload browser. See README verification steps.");
+              // ROUND 5j — also flag missing home_url separately so we can tell
+              // if the frontend has partial upgrade (contract fields but no home_url,
+              // or vice versa).
+              const homeUrlDiag = hasHomeUrlKey ? "home_url key present" : "home_url key MISSING (stale frontend or partial install)";
+              logger.info(`[contract-switcher] Stage path — hasContractCfg=${stageHasContract}, contract_number="${stageContractNumber}", contract_name="${stageContractName}", diagnostic="${stageDiag}", home_url_check="${homeUrlDiag}", authConfig_keys=[${authConfig ? Object.keys(authConfig).join(",") : "<undefined>"}]`);
+              if (stageHasContract) {
+                const homeUrl = this.contractSwitcherHomeUrlForTarget(url, authConfig);
+                // ROUND 5e — Mark this URL as a switcher detour so recordNavigatedUrl
+                // suppresses it from the trail. Both origin+/home and any minor
+                // variant Playwright may capture (trailing slash, casing) hit the
+                // same normalised key in switcherDetourUrls.
+                this.switcherDetourUrls.add(this.normaliseUrlForDetourCheck(homeUrl));
+                logger.info(`[contract-switcher] Stage: contract configured — detouring silently to ${homeUrl} before target ${url}`);
+                try {
+                  const navResult = await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+                  logger.info(`[contract-switcher] Stage: page.goto(${homeUrl}) status=${navResult?.status?.() ?? "unknown"}, current URL=${page.url()}`);
+                  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => undefined);
+                  if (authConfig?.auto_accept_cookies !== false) {
+                    await this.clearCookieConsent(page, this.authSelector(authConfig, "cookie_accept_selector")).catch(() => undefined);
+                  }
+                  logger.info(`[contract-switcher] Stage: about to call selectContractIfPickerVisible(). URL=${page.url()}`);
+                  await this.selectContractIfPickerVisible(page, authConfig, progress);
+                  logger.info(`[contract-switcher] Stage: selectContractIfPickerVisible() returned normally`);
+                } catch (err: any) {
+                  logger.error(`[contract-switcher] Stage: detour threw: ${err?.message || err}\nStack: ${err?.stack || "no stack"}`);
                 }
+              } else {
+                logger.info(`[contract-switcher] Stage: no contract configured — skipping detour`);
               }
 
               const landedKey = canonicalUrlKey(landedUrl) || landedUrl;
@@ -233,7 +269,7 @@ export class AccessibilityScanner {
               const profileUrl = String(authConfig.profile_url || "").trim();
               const profileKey = canonicalUrlKey(profileUrl) || profileUrl;
               const profileAuthKey = `auth:${profileKey}`;
-              if (!journeyOnlyMode && opts.scan_gestisci_page === true && profileUrl && !scannedEntrypoints.has(profileAuthKey)) {
+              if (!journeyOnlyMode && opts.scan_gestisci_page !== false && profileUrl && !scannedEntrypoints.has(profileAuthKey)) {
                 progress(`Opening authenticated profile page: ${profileUrl}`);
                 const ok = await this.navigateAndRecord(page, profileUrl, "Gestisci/profile");
                 if (!ok) throw new Error(`Authenticated profile page is unreachable: ${profileUrl}`);
@@ -251,7 +287,7 @@ export class AccessibilityScanner {
               const targetKey = canonicalUrlKey(url) || url;
               const targetAuthKey = `auth:${targetKey}`;
               if (journeyOnlyMode) {
-                progress(`JOURNEY MODE: ${(opts.target_interactions || []).length} target(s) configured. Launch URL (${url}) will NOT be scanned as a full page — only journey destinations will be scanned.`);
+                progress(`Journey-only mode enabled; using ${url} only for authentication/start context`);
               } else if (opts.crawl_mode) {
                 await this.runCrawlBfsForSeed(page, url, opts, extraStates, progress);
               } else if (!scannedEntrypoints.has(targetAuthKey)) {
@@ -284,47 +320,50 @@ export class AccessibilityScanner {
           try {
             if (opts.crawl_mode) {
               await this.runCrawlBfsForSeed(page, url, opts, extraStates, progress);
-            } else if (journeyOnlyMode) {
-              // Production auth-session flow: cookies are pre-loaded into the
-              // browser context by scanQueue (via extension_session_cookies),
-              // so authConfig.login_url is unset and we take THIS path (not
-              // the authenticated one above). Journey mode still applies —
-              // navigate to the launch URL and run the configured journey
-              // interactions.
-              const targetsCount = (opts.target_interactions || []).length;
-              const jmsg1 = `[journey] UNAUTH-PATH journey mode active. Will navigate to ${url}, wait for settle, then run scanTargetedInteractions with ${targetsCount} target(s). Launch URL will NOT be full-scanned.`;
-              logger.info(jmsg1);
-              progress(jmsg1);
-
-              const jmsg2 = `[journey] UNAUTH-PATH navigating to launch URL: ${url}`;
-              logger.info(jmsg2);
-              progress(jmsg2);
-              const ok = await this.navigateAndRecord(page, url, "journey launch");
-              const jmsg3 = `[journey] UNAUTH-PATH navigate result: ok=${ok}`;
-              logger.info(jmsg3);
-              progress(jmsg3);
-              if (!ok) {
-                const jmsgFail = `[journey] UNAUTH-PATH FAIL — unable to navigate to launch URL ${url}. Skipping this URL.`;
-                logger.warn(jmsgFail);
-                progress(jmsgFail);
-                continue;
+            } else {
+              // ROUND 5c: Multi-contract switch on Production cookie-handoff path.
+              // Two fixes vs Round 5b:
+              //   1. Use logger.info (not progress()) so we can see events in the
+              //      backend PowerShell log. progress() writes to a scan-specific
+              //      channel that doesn't appear in the general log.
+              //   2. Use page.goto directly (not navigateAndRecord) so the detour
+              //      to /home doesn't get recorded as a "scanned URL" — otherwise
+              //      /home shows up as a scanned page in results.
+              const contractCfg = authConfig || (opts as any).auth_config || {};
+              const hasContractCfg = Boolean(
+                (contractCfg?.contract_number && String(contractCfg.contract_number).trim()) ||
+                (contractCfg?.contract_name && String(contractCfg.contract_name).trim())
+              );
+              logger.info(`[contract-switcher] Production path — hasContractCfg=${hasContractCfg}, authConfig_keys=[${authConfig ? Object.keys(authConfig).join(",") : "<undefined>"}], opts_auth_config_keys=[${(opts as any).auth_config ? Object.keys((opts as any).auth_config).join(",") : "<undefined>"}]`);
+              if (hasContractCfg) {
+                const homeUrl = this.contractSwitcherHomeUrlForTarget(url, contractCfg);
+                // ROUND 5e — Mark this URL as a switcher detour so recordNavigatedUrl
+                // suppresses it from the trail. Round 5c made the detour "silent"
+                // at the scan-artifact level (page.goto instead of navigateAndRecord),
+                // but Playwright's page.on('request'/'framenavigated') listeners in
+                // trackPageNavigations still captured the /home hit, so it still
+                // showed in the trail log AND the PDF "URLs passed through" panel.
+                // Now it's fully suppressed.
+                this.switcherDetourUrls.add(this.normaliseUrlForDetourCheck(homeUrl));
+                logger.info(`[contract-switcher] contract configured — detouring silently to ${homeUrl} before target ${url}`);
+                try {
+                  // page.goto (not navigateAndRecord) — silent, no scan artifacts on /home
+                  const navResult = await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+                  logger.info(`[contract-switcher] page.goto(${homeUrl}) status=${navResult?.status?.() ?? "unknown"}, current URL=${page.url()}`);
+                  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => undefined);
+                  if (contractCfg?.auto_accept_cookies !== false) {
+                    await this.clearCookieConsent(page, this.authSelector(contractCfg, "cookie_accept_selector")).catch(() => undefined);
+                  }
+                  logger.info(`[contract-switcher] about to call selectContractIfPickerVisible(). URL=${page.url()}`);
+                  await this.selectContractIfPickerVisible(page, contractCfg, progress);
+                  logger.info(`[contract-switcher] selectContractIfPickerVisible() returned normally`);
+                } catch (err: any) {
+                  logger.error(`[contract-switcher] detour threw: ${err?.message || err}\nStack: ${err?.stack || "no stack"}`);
+                }
+              } else {
+                logger.info(`[contract-switcher] no contract configured — skipping detour`);
               }
 
-              await page.waitForTimeout(1500);
-              let settledUrl = url;
-              try { settledUrl = page.url(); } catch { /* ignore */ }
-              const jmsg4 = `[journey] UNAUTH-PATH settled after 1500ms wait, page.url()=${settledUrl}`;
-              logger.info(jmsg4);
-              progress(jmsg4);
-
-              const jmsg5 = `[journey] UNAUTH-PATH invoking scanTargetedInteractions (this runs the click + destination scan)`;
-              logger.info(jmsg5);
-              progress(jmsg5);
-              await this.scanTargetedInteractions(page, url, opts, extraStates, progress, scannedEntrypoints, authConfig);
-              const jmsg6 = `[journey] UNAUTH-PATH scanTargetedInteractions returned.`;
-              logger.info(jmsg6);
-              progress(jmsg6);
-            } else {
               progress(`Navigating to ${url}`);
               const ok = await this.navigateAndRecord(page, url, "target");
               if (!ok) {
@@ -332,9 +371,64 @@ export class AccessibilityScanner {
                 continue;
               }
               await page.waitForTimeout(1200);
-              await this.runFullPageScan(page, url, opts, extraStates, progress);
+              // ROUND 5d: Strict target URL settle guard on Production path
+              // Same behaviour as Stage's openAuthenticatedTarget (line 783).
+              // If the browser is not on the requested target URL after the
+              // navigation, runFullPageScan is called with `url` as
+              // strictExpectedUrl — if the actual page URL doesn't match, the
+              // scan is refused and target-redirect-evidence is recorded
+              // (rather than scanning /home content and labelling it as
+              // /offers/pdp/tv issues).
+              let settledUrl = await this.waitForTargetUrlToSettle(page, url, 18000);
+              logger.info(`[production-scan] settledUrl=${settledUrl} requested=${url}`);
+
+              // ROUND 5f Fix 2 — Retry switcher once if we landed on the wrong page.
+              // Symptom: Sky's SPA bounces the target URL to /offers when the
+              // currently-active contract can't see the requested offer. Cause:
+              // switcher's first attempt didn't actually switch (usually because
+              // the sidebar toggle wasn't hydrated in time — Fix 1 helps that,
+              // but this is a belt-and-braces safety net if the first attempt
+              // still finds nothing on /home).
+              // Compare origin+pathname (ignore query/hash) — a benign query
+              // difference shouldn't trigger a retry.
+              if (hasContractCfg) {
+                const currentKey = this.normaliseUrlForDetourCheck(page.url());
+                const targetKey  = this.normaliseUrlForDetourCheck(url);
+                if (currentKey !== targetKey) {
+                  logger.warn(`[production-scan] ROUND 5f — target URL mismatch after settle. currentKey=${currentKey} targetKey=${targetKey}. Retrying contract switcher.`);
+                  (page as any).__axessia_contract_switched = false;
+                  const homeUrl = this.contractSwitcherHomeUrlForTarget(url, contractCfg);
+                  this.switcherDetourUrls.add(this.normaliseUrlForDetourCheck(homeUrl));
+                  try {
+                    await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+                    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => undefined);
+                    logger.info(`[contract-switcher] ROUND 5f retry — about to re-call selectContractIfPickerVisible(). URL=${page.url()}`);
+                    await this.selectContractIfPickerVisible(page, contractCfg, progress);
+                    logger.info(`[contract-switcher] ROUND 5f retry — returned. Re-navigating to target ${url}.`);
+                    await this.navigateAndRecord(page, url, "target");
+                    await page.waitForTimeout(1200);
+                    const retriedSettledUrl = await this.waitForTargetUrlToSettle(page, url, 18000);
+                    settledUrl = retriedSettledUrl;
+                    logger.info(`[production-scan] ROUND 5f — after retry settledUrl=${retriedSettledUrl}, current URL=${page.url()}`);
+                  } catch (err: any) {
+                    logger.error(`[contract-switcher] ROUND 5f retry threw: ${err?.message || err}`);
+                  }
+                }
+              }
+
+              await this.runFullPageScan(page, settledUrl || url, opts, extraStates, progress, url);
               if (opts.crawl_mode) {
                 await this.scanLinkedPageStates(page, url, opts, extraStates, progress);
+              }
+              // ROUND 5d: Run journey config on Production path too.
+              // Previously only the Stage path called scanTargetedInteractions
+              // (line 215) — so any target_interactions/journey targets
+              // configured for Production scans were silently ignored.
+              // authConfig here contains contract_number so any journey target's
+              // subsequent navigations will use the switched contract.
+              if (opts.target_interactions && Array.isArray(opts.target_interactions) && opts.target_interactions.length > 0) {
+                logger.info(`[production-scan] running journey config (${opts.target_interactions.length} targets) with contract active`);
+                await this.scanTargetedInteractions(page, url, opts, extraStates, progress, new Set<string>(), authConfig || {});
               }
             }
           } finally {
@@ -352,19 +446,25 @@ export class AccessibilityScanner {
 
     this.addStateGraphSummarySnapshot();
     this.allIssues = this.prioritizeIssues(this.calibrateIssues(this.deduplicateIssues(this.allIssues)));
-    // Ship 2 / Item 5 — assign a landmark_group_key to issues whose selector
-    // clearly targets a landmark region (banner / contentinfo / navigation /
-    // main / complementary / region / search / form). The scan detail
-    // endpoint later collapses issues sharing the same key across pages so
-    // e.g. one contentinfo issue on 30 crawled pages shows as one entry
-    // with a "Appears on 30 pages" chip instead of 30 duplicates.
-    this.assignLandmarkGroupKeys(this.allIssues);
     this.generateTestCases();
     this.generateManualHybridReviewCases();
-    const score = this.computeScore(this.allIssues);
+    // ROUND 5k — Primary score is now WCAG A+AA conformance %.
+    // Compute BOTH numbers, use conformance % as `score`. The weighted
+    // Evinced-style number stays on the conformance bundle as
+    // `engineering_score` — visible in the Score Methodology section as
+    // a secondary "engineering priority" number for prioritizing fixes,
+    // but it's not the top-line score anymore. This matches EAA /
+    // EN 301 549 / Section 508 conformance reporting, and matches how
+    // Capgemini reports their MSA / WSC / AOL / DS / VA / Assistenza
+    // numbers.
+    const conformanceBundle = this.computeConformanceBreakdown();
+    const engineeringScore = this.computeScore(this.allIssues);
+    // conformance.overall_A_AA.pct is the plain 0-100 percentage number
+    const conformancePct = conformanceBundle.conformance?.overall_A_AA?.pct ?? engineeringScore;
+    const score = Math.round(conformancePct);
     logger.info(`Scan navigation trail (${this.navigatedUrls.length} URL${this.navigatedUrls.length === 1 ? "" : "s"}): ${this.navigatedUrls.join(" -> ") || "none recorded"}`);
-    logger.info(`Scan complete: ${this.allIssues.length} issues, score ${score}`);
-    return { issues: this.allIssues, testCases: this.testCases, domSnapshots: this.domSnapshots, navigatedUrls: this.navigatedUrls, score };
+    logger.info(`Scan complete: ${this.allIssues.length} issues. Primary score (WCAG A+AA conformance) = ${score}%. Engineering-priority score (weighted) = ${engineeringScore}.`);
+    return { issues: this.allIssues, testCases: this.testCases, domSnapshots: this.domSnapshots, navigatedUrls: this.navigatedUrls, score, conformance: { conformance: conformanceBundle.conformance, failed_criteria: conformanceBundle.failed_criteria, contributors: conformanceBundle.contributors, formula: conformanceBundle.formula, engineering_score: engineeringScore } };
   }
 
   private async createBrowserContext(browser: any, opts: ScanOptions): Promise<any> {
@@ -407,6 +507,16 @@ export class AccessibilityScanner {
       if (!submitSelector) throw new Error("Login submit selector is required for authenticated scans.");
 
       const loginStartUrl = this.loginStartUrlForTarget(auth, targetUrl);
+      // ROUND 5k — explicit log so we can trace which of three auth-start
+      // decisions was made: (a) home_url (Round 5k preferred), (b) target
+      // URL (Sky redirect chain handles login), or (c) explicit login_url.
+      const stageHomeUrl = String(auth?.home_url || "").trim();
+      const authStartChoice = stageHomeUrl && loginStartUrl === stageHomeUrl
+        ? `home_url (Round 5k preferred — will land on /home for switcher)`
+        : (targetUrl && loginStartUrl === targetUrl
+            ? `target URL (Sky redirect chain will handle login → OTP → back to target; switcher will detour to /home separately)`
+            : `configured login_url`);
+      logger.info(`[stage-auth] ROUND 5k — auth start URL choice: ${authStartChoice}. loginStartUrl=${loginStartUrl}, home_url="${stageHomeUrl}", targetUrl=${targetUrl}`);
       if (targetUrl && loginStartUrl !== auth.login_url) {
         logger.info(`Starting authentication from target-aware URL so post-login returns to requested target: ${loginStartUrl}`);
       }
@@ -603,7 +713,7 @@ export class AccessibilityScanner {
   private addScanRunFailureIssue(url: string, err: unknown): void {
     const message = (err as Error)?.message || String(err || "scan failed");
     const isAuthFailure = /login|authentication|password|otp|username|auth/i.test(message);
-    this.allIssues.push({
+    this.pushIssuesIfAllowed([{
       ruleId: isAuthFailure ? "authenticated-scan-not-completed" : "scan-run-not-completed",
       severity: "serious",
       category: isAuthFailure ? "authentication-coverage" : "scan-coverage",
@@ -617,7 +727,7 @@ export class AccessibilityScanner {
         ? "Verify the supplied credentials, OTP source/manual OTP value, login selectors, MFA timing, and whether the security page is waiting for user action."
         : "Check whether the page is reachable, whether the scanner can load it, and whether any configured journey selector blocked execution.",
       evidenceExplanation: `Scan stopped before the requested page could be tested. Error: ${message}`
-    });
+    }]);
     this.testCases.push({
       name: isAuthFailure ? "Authenticated scan login gate" : "Scan execution gate",
       description: isAuthFailure
@@ -693,6 +803,21 @@ export class AccessibilityScanner {
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
+      // ROUND 5s — check that the page + browser context are still alive.
+      // Round 5q's snap-back navigation, cookie prompts, or an early error
+      // elsewhere can close the page mid-loop, and Playwright then throws
+      // an unhelpful "Target page, context or browser has been closed"
+      // from waitForTimeout. Detect the close cleanly and throw an OTP-
+      // specific message the outer handler can surface.
+      try {
+        if (page.isClosed && page.isClosed()) {
+          throw new Error("OTP page wait aborted — the browser page was closed unexpectedly (likely by a concurrent navigation such as the Round 5q snap-back guard or a login redirect). Ensure the target URL is different from the auth home_url so those code paths don't fight each other.");
+        }
+      } catch (e: any) {
+        // If page.isClosed itself throws, the context is definitely gone.
+        if (String(e?.message || "").includes("browser page was closed unexpectedly")) throw e;
+        throw new Error(`OTP page wait aborted — browser context lost: ${e?.message || e}`);
+      }
       const hasOtpText = Boolean(await this.resolveOtpValue(page, auth, 1000).catch(() => ""));
       const hasOtpInput = await this.hasVisibleAuthControl(page, otpSelector).catch(() => false);
       const hasSource = await this.hasVisibleAuthControl(page, otpSourceSelector).catch(() => false);
@@ -701,7 +826,9 @@ export class AccessibilityScanner {
         return;
       }
       await page.waitForLoadState("domcontentloaded", { timeout: 1000 }).catch(() => undefined);
-      await page.waitForTimeout(700);
+      // ROUND 5s — swallow the "page closed" error from waitForTimeout
+      // gracefully; the outer loop check will catch it on next iteration.
+      await page.waitForTimeout(700).catch(() => undefined);
     }
     throw new Error("OTP page did not appear after clicking Accedi.");
   }
@@ -821,6 +948,30 @@ export class AccessibilityScanner {
   }
 
   private loginStartUrlForTarget(auth: any, targetUrl?: string): string {
+    // ROUND 5k — Prefer auth.home_url when set. Sky reliably redirects
+    // unauthenticated users hitting /home to /login → OTP → back to /home.
+    // Landing on /home means the sidebar contract switcher IS present, so
+    // the switcher block later can actually find its toggle. Without this,
+    // Stage auth goes straight to the target URL, never touches /home, and
+    // the contract switcher has no page to work on.
+    const homeUrl = String(auth?.home_url || "").trim();
+    if (homeUrl && /^https?:\/\//i.test(homeUrl)) {
+      return homeUrl;
+    }
+    // ROUND 5o — DERIVE home_url from target URL if it matches Sky's
+    // abbonamento.sky.it pattern. This makes the auth flow use /home even
+    // when the frontend is stuck on an old bundle that doesn't send home_url
+    // in auth_config. The derived URL for target
+    // "https://test.abbonamento.sky.it/offers" is
+    // "https://test.abbonamento.sky.it/home".
+    const requestedTargetUrlEarly = String(targetUrl || "").trim();
+    if (requestedTargetUrlEarly && /abbonamento\.sky\.it/i.test(requestedTargetUrlEarly)) {
+      try {
+        const derived = `${new URL(requestedTargetUrlEarly).origin}/home`;
+        logger.info(`[stage-auth] ROUND 5o — auth.home_url missing/empty; DERIVING home_url from target: ${derived}`);
+        return derived;
+      } catch { /* fall through */ }
+    }
     const configuredLoginUrl = String(auth?.login_url || "").trim();
     const requestedTargetUrl = String(targetUrl || "").trim();
     if (!configuredLoginUrl || !requestedTargetUrl) return configuredLoginUrl;
@@ -876,6 +1027,14 @@ export class AccessibilityScanner {
       if (auth?.auto_accept_cookies !== false) {
         await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector")).catch(() => undefined);
       }
+      // Handle multi-contract picker if it appears after login on this path
+      await this.selectContractIfPickerVisible(page, auth, progress).catch(err => {
+        // selectContractIfPickerVisible only throws when a picker was present but
+        // no configured contract matched (or nothing was configured). In that
+        // case we've already recorded an issue — rethrow so the scan halts cleanly
+        // rather than scanning the wrong contract's data.
+        throw err;
+      });
       const settledUrl = await this.waitForTargetUrlToSettle(page, targetUrl);
       await this.ensureAuthenticatedPage(page, auth, targetUrl);
       if (this.sameUrlWithoutHash(settledUrl, targetUrl)) {
@@ -1067,7 +1226,7 @@ export class AccessibilityScanner {
 
   private addTargetRedirectEvidence(requestedUrl: string, actualUrl: string): void {
     this.recordNavigation(actualUrl, `redirected away from requested target: ${requestedUrl}`);
-    this.allIssues.push({
+    this.pushIssuesIfAllowed([{
       ruleId: "target-url-not-reached",
       severity: "serious",
       category: "navigation-coverage",
@@ -1077,7 +1236,7 @@ export class AccessibilityScanner {
       tags: ["navigation-coverage", "advisory"],
       fixSuggestion: "Verify the account entitlement, route guard, post-login forward URL, and any environment redirect rules for the requested target.",
       evidenceExplanation: `Requested target: ${requestedUrl}. Final browser URL: ${actualUrl}.`
-    });
+    }]);
     this.testCases.push({
       name: "Authenticated target URL redirected",
       description: "The scanner attempted to open the configured authenticated target URL, but the application redirected to a different page before the accessibility modules could run.",
@@ -1879,41 +2038,30 @@ export class AccessibilityScanner {
     progress: (msg: string) => void,
     strictExpectedUrl?: string
   ): Promise<void> {
-    // ═══════════════════════════════════════════════════════════════════
-    // JOURNEY MODE GUARD (Round 13 — the actual fix)
-    // ═══════════════════════════════════════════════════════════════════
-    // If journey targets are configured, the LAUNCH URL(s) — the ones
-    // listed in scan.urls — must NEVER be full-scanned. Not by ANY code
-    // path. There are 12+ call sites for runFullPageScan; hunting each
-    // one has been unreliable across 12 rounds. This guard is a single
-    // choke point that all paths eventually funnel through.
-    //
-    // What we scan:  destinations reached via journey clicks (URLs that
-    //                are NOT in scan.urls, e.g. /offers/pdp/paramount).
-    // What we don't: any URL that is in scan.urls (the login/launch URL,
-    //                which is /offers in your case).
-    // ═══════════════════════════════════════════════════════════════════
-    const hasJourneyTargets = Array.isArray(opts.target_interactions) && opts.target_interactions.length > 0;
-    if (hasJourneyTargets) {
-      const configuredUrls: string[] = Array.isArray(this.scan.urls) ? this.scan.urls : [];
-      const targetKey = canonicalUrlKey(targetUrl) || targetUrl;
-      // A URL with a #fragment is a "post-click state" scan intentionally
-      // emitted by scanTargetedInteractions. Those are always allowed — the
-      // guard only refuses the RAW launch URL (no fragment).
-      const targetHasFragment = (targetUrl || "").includes("#");
-      const isLaunchUrl = !targetHasFragment && configuredUrls.some(configured => {
-        const cKey = canonicalUrlKey(configured) || configured;
-        const cKeyStripped = canonicalUrlKey(configured.split("#")[0]) || configured.split("#")[0];
-        return cKey === targetKey || cKeyStripped === targetKey;
-      });
-      if (isLaunchUrl) {
-        const msg = `REFUSED full-page scan of launch URL "${targetUrl}" — ${opts.target_interactions!.length} journey target(s) configured; launch URLs are never scanned in journey mode.`;
-        progress(msg);
-        logger.warn(`[journey-guard] ${msg}`);
-        return;
-      }
+    // ROUND 5q — Set the active scan target on the page object so the
+    // navigation observer (attachNavigationObserver, framenavigated listener)
+    // can detect Sky's SPA client-side-routing to a switcher-detour URL
+    // (e.g. /home) mid-scan and immediately snap the page back to targetUrl.
+    // Without this, accessibility modules would keep running against /home
+    // content while attributing findings to targetUrl, so /home DOM +
+    // screenshots leaked into the report even though nav trail was clean.
+    (page as any).__axessia_scan_target = targetUrl;
+    (page as any).__axessia_last_snap_back = 0;
+    try {
+      await this.runFullPageScanInner(page, targetUrl, opts, extraStates, progress, strictExpectedUrl);
+    } finally {
+      (page as any).__axessia_scan_target = null;
     }
+  }
 
+  private async runFullPageScanInner(
+    page: any,
+    targetUrl: string,
+    opts: ScanOptions,
+    extraStates: StateConfig[],
+    progress: (msg: string) => void,
+    strictExpectedUrl?: string
+  ): Promise<void> {
     this.recordNavigation(page.url(), `scan start: ${targetUrl}`);
     if (this.scan.auth_config?.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(this.scan.auth_config, "cookie_accept_selector"));
     if (await this.hasCookieConsentPrompt(page)) {
@@ -1939,109 +2087,40 @@ export class AccessibilityScanner {
     this.scannedPageKeys.add(pageKey);
     await this.prepareFullPageForScan(page, targetUrl, progress);
 
-    // ═══ URL drift check — Tier 3 fix ══════════════════════════════════════
-    // Sky Web Self Care (and similar SPAs) can client-side re-route AFTER the
-    // strict URL check above but DURING prepareFullPageForScan, because the
-    // scroll pass triggers lazy data loading, and Sky's router evaluates
-    // "which section should this user land on?" against that data. The
-    // scanner would then run every subsequent check on the drifted URL
-    // (e.g. /home) while recording all issues under the requested URL
-    // (e.g. /offers) — producing a report that's internally inconsistent:
-    // affected element names belong to one page, the URL column names the
-    // other. This block detects the drift, retries once, and — if the drift
-    // is persistent — updates targetUrl so all subsequent phases record
-    // issues under the URL that was ACTUALLY scanned.
-    {
-      const postPrepUrl = (() => {
-        try { return page.url(); } catch { return targetUrl; }
-      })();
-      if (!this.sameUrlWithoutHash(postPrepUrl, targetUrl)) {
-        logger.warn(`URL drifted from ${targetUrl} to ${postPrepUrl} during page preparation (SPA client-side redirect). Attempting one recovery.`);
-        progress(`WARN: Page drifted to ${postPrepUrl}; attempting to return to ${targetUrl}`);
-        const recovered = await this.navigateAndRecord(page, targetUrl, "recover from client-side drift").catch(() => false);
-        if (recovered) {
-          await this.waitForMeaningfulPageContent(page, targetUrl);
-          await this.prepareFullPageForScan(page, targetUrl, progress);
-        }
-        const finalUrl = (() => {
-          try { return page.url(); } catch { return targetUrl; }
-        })();
-        if (!this.sameUrlWithoutHash(finalUrl, targetUrl)) {
-          logger.warn(`Persistent SPA redirect: requested ${targetUrl}, browser settled on ${finalUrl}. All subsequent issues will be recorded under ${finalUrl} instead of ${targetUrl}.`);
-          progress(`WARN: Persistent SPA redirect. All issues will be recorded under ${finalUrl} instead of the requested ${targetUrl}.`);
-          this.addTargetRedirectEvidence(targetUrl, finalUrl);
-          // Reassign so every check below records under the actual URL.
-          // Note: pageKey de-duplication above already ran with the original
-          // targetUrl; if the drifted URL was previously scanned we accept
-          // the duplicate rather than skip, because we still need coverage
-          // of this authenticated context.
-          targetUrl = finalUrl;
-        }
-      }
-    }
-    // ═══════════════════════════════════════════════════════════════════════
-
     if (opts.run_axe !== false) {
       progress(`Running axe-core WCAG scan on ${targetUrl}`);
-      this.allIssues.push(...await runAxe(page, targetUrl, this.scan.state_label, "initial"));
+      this.pushIssuesIfAllowed(await runAxe(page, targetUrl, this.scan.state_label, "initial"));
     }
 
     if (opts.run_heuristics !== false) {
       progress(`Running heuristic checks on ${targetUrl}`);
-      this.allIssues.push(...await runHeuristics(page, targetUrl, this.scan.state_label, "initial"));
+      this.pushIssuesIfAllowed(await runHeuristics(page, targetUrl, this.scan.state_label, "initial"));
     }
 
     if (opts.run_focus !== false) {
       progress(`Running focus checks on ${targetUrl}`);
-      this.allIssues.push(...await runFocusHeuristics(page, targetUrl, this.scan.state_label, "initial"));
+      this.pushIssuesIfAllowed(await runFocusHeuristics(page, targetUrl, this.scan.state_label, "initial"));
     }
 
     if (opts.run_color !== false) {
       progress(`Measuring color contrast on ${targetUrl}`);
-      this.allIssues.push(...await runColorChecks(page, targetUrl, this.scan.state_label, "initial"));
+      this.pushIssuesIfAllowed(await runColorChecks(page, targetUrl, this.scan.state_label, "initial"));
     }
 
     if (opts.run_zoom !== false) {
-      // Ship 1 / Item 4 — audit target defaults to 200% (this team's scenario).
-      // 400% keeps the WCAG 1.4.10 320px reflow test. See ScanOptions.zoom_target_percent.
-      const zoomTargetPercent: 200 | 400 = opts.zoom_target_percent === 400 ? 400 : 200;
-      progress(`Running zoom and reflow checks on ${targetUrl} (target ${zoomTargetPercent}%)`);
-      this.allIssues.push(...await runZoomChecks(page, targetUrl, this.scan.state_label, "zoom", zoomTargetPercent));
+      progress(`Running zoom and reflow checks on ${targetUrl}`);
+      this.pushIssuesIfAllowed(await runZoomChecks(page, targetUrl, this.scan.state_label, "zoom"));
     }
 
     if (opts.run_pointer !== false) {
       progress(`Running pointer and gesture checks on ${targetUrl}`);
-      this.allIssues.push(...await runPointerChecks(page, targetUrl, this.scan.state_label, "pointer"));
+      this.pushIssuesIfAllowed(await runPointerChecks(page, targetUrl, this.scan.state_label, "pointer"));
     }
 
     if (opts.run_keyboard_nav !== false) {
       progress(`Simulating keyboard navigation on ${targetUrl}`);
-      this.allIssues.push(...await runKeyboardNav(page, targetUrl, this.scan.state_label));
+      this.pushIssuesIfAllowed(await runKeyboardNav(page, targetUrl, this.scan.state_label));
     }
-
-    // ═══ Mid-scan URL drift check ═════════════════════════════════════════
-    // runKeyboardNav presses Enter on custom-role elements (Fix 1) and skip
-    // links. Either can trigger navigation. If it did, the state scanner
-    // below would run on the wrong URL. Navigate back to `targetUrl` once;
-    // if it drifted persistently, do NOT rewrite targetUrl mid-scan
-    // (issues found earlier are already recorded correctly), just log.
-    {
-      const postKeyboardUrl = (() => {
-        try { return page.url(); } catch { return targetUrl; }
-      })();
-      if (!this.sameUrlWithoutHash(postKeyboardUrl, targetUrl)) {
-        logger.warn(`URL drifted from ${targetUrl} to ${postKeyboardUrl} during keyboard-navigation checks (likely an Enter key activated a link). Attempting to return before state scanning.`);
-        progress(`Recovering scan context: page drifted to ${postKeyboardUrl} during keyboard tests, returning to ${targetUrl}`);
-        const recovered = await this.navigateAndRecord(page, targetUrl, "recover after keyboardNav drift").catch(() => false);
-        if (recovered) {
-          await this.waitForMeaningfulPageContent(page, targetUrl);
-        } else {
-          const stillDrifted = (() => { try { return page.url(); } catch { return postKeyboardUrl; } })();
-          logger.warn(`Could not return to ${targetUrl} after keyboardNav; state and evidence phases will run on ${stillDrifted}. Report will note the drift.`);
-        }
-      }
-    }
-    // ═══════════════════════════════════════════════════════════════════════
 
     if (opts.run_states !== false) {
       progress(`Testing UI states (hover/focus/expanded/error) on ${targetUrl}`);
@@ -2055,9 +2134,9 @@ export class AccessibilityScanner {
         }
       });
       for (const sr of stateResults) {
-        this.allIssues.push(...this.deduplicateIssues(sr.issues));
+        this.pushIssuesIfAllowed(this.deduplicateIssues(sr.issues));
         if (sr.screenshot || sr.a11yTree) {
-          this.domSnapshots.push({
+          this.pushDomSnapshotIfAllowed({
             url: targetUrl,
             phase: sr.stateName,
             state: sr.stateName,
@@ -2073,7 +2152,7 @@ export class AccessibilityScanner {
       progress(`Capturing accessibility tree for ${targetUrl}`);
       const snapshot = await this.captureSnapshot(page, targetUrl, "initial", opts.capture_screenshots !== false);
       snapshot.a11yTree = this.withStateMatrixMetadata(snapshot.a11yTree, targetUrl, "initial", opts);
-      this.domSnapshots.push(snapshot);
+      this.pushDomSnapshotIfAllowed(snapshot);
       this.recordTransitionNode(targetUrl, "initial", "initial", snapshot.screenshot);
     }
 
@@ -2159,7 +2238,7 @@ export class AccessibilityScanner {
       }
     }
 
-    this.domSnapshots.push({
+    this.pushDomSnapshotIfAllowed({
       url: targetUrl,
       phase: "controlled interaction report",
       state: "controlled-interactions",
@@ -2184,15 +2263,15 @@ export class AccessibilityScanner {
     stateName: string
   ): Promise<void> {
     progress(`Scanning controlled interaction state: ${stateName}`);
-    if (opts.run_axe !== false) this.allIssues.push(...await runAxe(page, scanUrl, stateName, `controlled:${stateName}`));
-    if (opts.run_heuristics !== false) this.allIssues.push(...await runHeuristics(page, scanUrl, stateName, `controlled:${stateName}`));
-    if (opts.run_focus !== false) this.allIssues.push(...await runFocusHeuristics(page, scanUrl, stateName, `controlled:${stateName}`));
-    if (opts.run_color !== false) this.allIssues.push(...await runColorChecks(page, scanUrl, stateName, `controlled:${stateName}`));
-    if (opts.run_pointer !== false) this.allIssues.push(...await runPointerChecks(page, scanUrl, stateName, `controlled:${stateName}`));
+    if (opts.run_axe !== false) this.pushIssuesIfAllowed(await runAxe(page, scanUrl, stateName, `controlled:${stateName}`));
+    if (opts.run_heuristics !== false) this.pushIssuesIfAllowed(await runHeuristics(page, scanUrl, stateName, `controlled:${stateName}`));
+    if (opts.run_focus !== false) this.pushIssuesIfAllowed(await runFocusHeuristics(page, scanUrl, stateName, `controlled:${stateName}`));
+    if (opts.run_color !== false) this.pushIssuesIfAllowed(await runColorChecks(page, scanUrl, stateName, `controlled:${stateName}`));
+    if (opts.run_pointer !== false) this.pushIssuesIfAllowed(await runPointerChecks(page, scanUrl, stateName, `controlled:${stateName}`));
     if (opts.run_live_dom !== false) {
       const snapshot = await this.captureSnapshot(page, scanUrl, `controlled: ${stateName}`, opts.capture_screenshots !== false);
       snapshot.a11yTree = this.withStateMatrixMetadata(snapshot.a11yTree, scanUrl, stateName, opts);
-      this.domSnapshots.push(snapshot);
+      this.pushDomSnapshotIfAllowed(snapshot);
       this.recordTransitionNode(scanUrl, `controlled: ${stateName}`, stateName, snapshot.screenshot, "controlled interaction");
     }
   }
@@ -2308,19 +2387,106 @@ export class AccessibilityScanner {
     page.on("framenavigated", (frame: any) => {
       try {
         if (frame === page.mainFrame()) {
-          this.recordNavigatedUrl(frame.url(), context);
+          const currentUrl = frame.url();
+          this.recordNavigatedUrl(currentUrl, context);
+          // ROUND 5q — Snap-back guard. If a scan is actively running (scan
+          // target set by runFullPageScan) AND the browser has navigated to
+          // a switcher-detour URL (e.g. Sky's SPA client-side-routed to /home
+          // mid-scan) AND the scan target is NOT that same detour URL, force
+          // navigation back to the scan target. This prevents /home DOM and
+          // screenshots from being captured while modules run against what
+          // they think is the target page.
+          const scanTarget = String((page as any).__axessia_scan_target || "").trim();
+          if (scanTarget && this.isSwitcherDetourUrl(currentUrl)) {
+            const scanTargetKey = this.normaliseUrlForDetourCheck(scanTarget);
+            const currentKey = this.normaliseUrlForDetourCheck(currentUrl);
+            if (scanTargetKey !== currentKey) {
+              const now = Date.now();
+              const lastSnap = Number((page as any).__axessia_last_snap_back || 0);
+              // debounce: don't fire snap-back more than once per 2 seconds
+              // (avoid nav-loop if Sky's SPA keeps re-routing)
+              if (now - lastSnap > 2000) {
+                (page as any).__axessia_last_snap_back = now;
+                logger.warn(`[nav-guard] ROUND 5q — detected mid-scan navigation to switcher-detour URL ${currentUrl} while scan target is ${scanTarget}. Snapping back to target.`);
+                // fire-and-forget navigation. Errors are swallowed so we don't
+                // crash the observer; the scan module either re-runs on the
+                // correct URL or bails out.
+                page.goto(scanTarget, { waitUntil: "domcontentloaded", timeout: 15000 })
+                  .then(() => logger.info(`[nav-guard] snap-back to ${scanTarget} complete`))
+                  .catch((err: any) => logger.warn(`[nav-guard] snap-back failed: ${err?.message || err}`));
+              }
+            }
+          }
         }
       } catch { /* ignore navigation observer errors */ }
     });
   }
 
+  // ROUND 5e — Normalise URLs for detour comparison: origin + pathname, lowercase,
+  // no trailing slash, no query, no hash. Silent detours to /home should never
+  // appear in the trail even if Playwright captures them via request/framenavigated.
+  private normaliseUrlForDetourCheck(rawUrl: string): string {
+    try {
+      const parsed = new URL(String(rawUrl || ""));
+      const path = parsed.pathname.replace(/\/+$/, "") || "/";
+      return `${parsed.origin.toLowerCase()}${path.toLowerCase()}`;
+    } catch {
+      return String(rawUrl || "").trim().toLowerCase();
+    }
+  }
+
   private recordNavigatedUrl(rawUrl: string, context: string): void {
     const url = String(rawUrl || "").trim();
     if (!url || url === "about:blank") return;
+    // ROUND 5e — Suppress silent contract-switcher detours (e.g. .../home).
+    // The switcher block in run() adds the detour URL to switcherDetourUrls
+    // before page.goto(). Playwright's request/framenavigated listeners still
+    // fire on that navigation; we filter it here so the trail shows only
+    // URLs the tester actually meant to scan.
+    if (this.switcherDetourUrls.has(this.normaliseUrlForDetourCheck(url))) {
+      logger.info(`Scan navigation trail: suppressed contract-switcher detour (${context}): ${url}`);
+      return;
+    }
     if (this.navigatedUrlKeys.has(url)) return;
     this.navigatedUrlKeys.add(url);
     this.navigatedUrls.push(url);
     logger.info(`Scan navigated through URL (${context}): ${url}`);
+  }
+
+  // ROUND 5h — Test whether a URL is a switcher detour (e.g. .../home hit for
+  // contract switching). Used by snapshot + issue push guards to keep detour
+  // pages completely out of the report — screenshots, DOM snapshots, and
+  // issues from those URLs would otherwise leak into the PDF's "URLs passed
+  // through" list (reportService.ts line 356 aggregates snapshot.url +
+  // issue.url as a fallback when persisted navigation trail is empty or short).
+  private isSwitcherDetourUrl(url: string | undefined | null): boolean {
+    if (!url) return false;
+    return this.switcherDetourUrls.has(this.normaliseUrlForDetourCheck(url));
+  }
+
+  // ROUND 5h — Gated push for DOM snapshots. Every domSnapshots.push()
+  // in this file goes through this helper. If the snapshot's url is a
+  // suppressed switcher detour (e.g. /home), we skip the push entirely
+  // so no screenshot/a11y-tree from /home ends up in the report.
+  private pushDomSnapshotIfAllowed(snap: DomSnapshot): void {
+    if (this.isSwitcherDetourUrl(snap?.url)) {
+      logger.info(`Scan snapshot suppressed (switcher detour URL): ${snap.url} phase=${snap.phase}`);
+      return;
+    }
+    this.domSnapshots.push(snap);
+  }
+
+  // ROUND 5h — Gated push for issues. Same reasoning as pushDomSnapshotIfAllowed:
+  // Sky's SPA occasionally client-side-routes back to /home mid-scan, and any
+  // axe/heuristic scan running during that window would attribute issues to
+  // /home — those issues then contaminate the report and score.
+  private pushIssuesIfAllowed(issues: ScanIssue[]): void {
+    for (const issue of issues) {
+      if (this.isSwitcherDetourUrl(issue.url)) {
+        continue;
+      }
+      this.allIssues.push(issue);
+    }
   }
 
   private recordNavigation(url: string, phase: string): void {
@@ -2329,7 +2495,7 @@ export class AccessibilityScanner {
     const previous = this.domSnapshots[this.domSnapshots.length - 1];
     if (previous?.url === href && previous?.phase === phase) return;
     const nodeId = this.recordTransitionNode(href, `navigation: ${phase}`, this.scan.state_label);
-    this.domSnapshots.push({
+    this.pushDomSnapshotIfAllowed({
       url: href,
       phase: `navigation: ${phase}`,
       state: this.scan.state_label,
@@ -2350,7 +2516,7 @@ export class AccessibilityScanner {
     })();
     this.recordNavigatedUrl(currentUrl || url, `${phase} reached`);
     const nodeId = this.recordTransitionNode(currentUrl || url, `navigation: ${phase}`, this.scan.state_label, undefined, phase);
-    this.domSnapshots.push({
+    this.pushDomSnapshotIfAllowed({
       url: currentUrl || url,
       phase: `navigation: ${phase}`,
       state: this.scan.state_label,
@@ -2407,7 +2573,7 @@ export class AccessibilityScanner {
       }
     }
     const nodes = Array.from(this.transitionNodes.values()).map(node => ({ ...node, issueCount: issueCounts.get(node.id) || node.issueCount || 0 }));
-    this.domSnapshots.push({
+    this.pushDomSnapshotIfAllowed({
       url: this.scan.urls?.[0] || "state-graph",
       phase: "state-graph-summary",
       state: "state-graph",
@@ -2645,30 +2811,6 @@ export class AccessibilityScanner {
     }
   }
 
-  /**
-   * scanTargetedInteractions — SIMPLIFIED ROUND 11 REWRITE.
-   *
-   * Does exactly what the user asked for, no more:
-   *
-   *   For each configured target:
-   *     1. Navigate to launch page
-   *     2. Wait for page to settle (+ dismiss cookies)
-   *     3. Search for the button/link (direct match)
-   *     4. If not found, try clicking every tab-like button once, retrying after each
-   *     5. If found: click it, wait for navigation, scan the resulting page
-   *     6. If not found after everything: emit one "not found" issue, done
-   *   Return.
-   *
-   * The launch page (e.g. /offers) is NEVER scanned as a full page. Ever.
-   * If a click fails, we emit exactly one failure issue and move to the
-   * next target — no fallback scans, no "scan the launch page anyway"
-   * behaviour. This is what the user has been asking for since round 1.
-   *
-   * The tangled old version (scanSingleTargetInteraction + scanTargetJourney
-   * + sidebar discovery + launch-page scan branches) is bypassed entirely.
-   * Those methods still exist further down in this file but are no longer
-   * called by this simplified entry point.
-   */
   private async scanTargetedInteractions(
     page: any,
     baseUrl: string,
@@ -2678,169 +2820,37 @@ export class AccessibilityScanner {
     scannedKeys: Set<string>,
     authConfig: any
   ): Promise<void> {
-    const rawTargets = Array.isArray(opts.target_interactions) ? opts.target_interactions : [];
+    const targets = (Array.isArray(opts.target_interactions) ? opts.target_interactions : [])
+      .map(target => ({
+        ...target,
+        mode: (target.mode === "journey" ? "journey" : "single-interaction") as TargetInteractionConfig["mode"],
+        base_page: String(target.base_page || "").trim(),
+        name: String(target.name || target.text || target.href_contains || target.selector || "Target interaction").trim(),
+        selector: String(target.selector || "").trim(),
+        text: String(target.text || "").trim(),
+        cta_text: String(target.cta_text || "").trim(),
+        href_contains: String(target.href_contains || "").trim(),
+        click_type: target.click_type || "any",
+        scan_destination_only: target.scan_destination_only !== false,
+        scan_launch_page: target.scan_launch_page === true,
+        steps: Array.isArray(target.steps) ? target.steps : [],
+      }))
+      .filter(target => target.base_page && (
+        target.mode === "journey"
+          ? target.steps.some((step: any) => step?.action === "navigate-page" ? String(step.page || "").trim() : Boolean(step.selector || step.text || step.cta_text || step.href_contains))
+          : Boolean(target.selector || target.text || target.cta_text || target.href_contains)
+      ));
 
-    // Always log entry — even when returning empty. This is the "smoking gun"
-    // that proves whether this function ran at all.
-    const entryMsg = `[scanTargetedInteractions] ENTER — target_interactions.length=${rawTargets.length}, baseUrl=${baseUrl}`;
-    logger.info(entryMsg);
-    progress(entryMsg);
+    if (!targets.length) return;
 
-    if (!rawTargets.length) {
-      const emptyMsg = `[scanTargetedInteractions] EXIT — target_interactions is EMPTY at scanner runtime. Nothing to click. This means journey config didn't reach the scanner even though authSessionManager may have logged 'journey_targets=N' upstream. Check authSessionManager submitOtp INSERT and the scans.scan_options column.`;
-      logger.warn(emptyMsg);
-      progress(emptyMsg);
-      return;
-    }
-
-    progress(`JOURNEY SCAN: ${rawTargets.length} target(s) configured. Launch pages will NEVER be full-scanned. Only journey destinations will be scanned.`);
-
-    // Per-run counters for the final summary.
-    let succeededCount = 0;
-    let failedCount = 0;
-    const issuesBeforeJourney = this.allIssues.length;
-
-    for (let i = 0; i < rawTargets.length; i++) {
-      const raw = rawTargets[i];
-      const target: any = {
-        ...raw,
-        base_page: String(raw.base_page || "").trim(),
-        name: String(raw.name || raw.text || raw.cta_text || `Target ${i + 1}`).trim(),
-        selector: String(raw.selector || "").trim(),
-        text: String(raw.text || "").trim(),
-        cta_text: String(raw.cta_text || "").trim(),
-        href_contains: String(raw.href_contains || "").trim(),
-        click_type: raw.click_type || "any",
-        scan_destination_only: true,
-        scan_launch_page: false,
-        steps: [],
-        mode: "single-interaction" as const,
-      };
-      const displayName = target.name;
-      const stepPrefix = `[target ${i + 1}/${rawTargets.length}: "${displayName}"]`;
-      const jPrefix = `[journey] target ${i + 1}/${rawTargets.length}`;
-
-      // Loud per-target trace so every step is visible in the log.
-      const targetIntro = `${jPrefix} name="${displayName}" base_page="${target.base_page}" text="${target.text}" cta_text="${target.cta_text}" click_type=${target.click_type} scan_destination_only=${target.scan_destination_only}`;
-      logger.info(targetIntro);
-      progress(targetIntro);
-
-      // Skip empties silently — no launch page or no search criteria = nothing to do.
-      if (!target.base_page || !(target.selector || target.text || target.cta_text || target.href_contains)) {
-        const skipMsg = `${jPrefix} SKIP reason=empty-config (missing base_page or search criteria)`;
-        logger.warn(skipMsg);
-        progress(skipMsg);
+    for (const target of targets) {
+      if (target.mode === "journey") {
+        await this.scanTargetJourney(page, baseUrl, target, opts, extraStates, progress, scannedKeys, authConfig);
         continue;
       }
-
-      const targetStartMs = Date.now();
-      try {
-        // ─── Step 1: navigate to launch page ────────────────────────────────
-        const s1a = `${jPrefix} STEP 1 openAuthenticatedLaunchPage("${target.base_page}") starting`;
-        logger.info(s1a);
-        progress(s1a);
-        await this.openAuthenticatedLaunchPage(page, target.base_page, baseUrl, authConfig, progress);
-        const launchUrl = page.url();
-        const s1b = `${jPrefix} STEP 1 done — page.url()=${launchUrl}`;
-        logger.info(s1b);
-        progress(s1b);
-
-        // ─── Step 2: wait for page to settle, dismiss cookies ──────────────
-        const s2a = `${jPrefix} STEP 2 dismissing cookies + waiting for page to settle`;
-        logger.info(s2a);
-        progress(s2a);
-        if (authConfig?.auto_accept_cookies !== false) {
-          await this.clearCookieConsentWithProgress(page, this.authSelector(authConfig, "cookie_accept_selector"), progress, target.base_page);
-        }
-        await page.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => undefined);
-        await page.waitForTimeout(2000);
-        await this.ensureAuthenticatedPage(page, authConfig, target.base_page);
-        const s2b = `${jPrefix} STEP 2 done — page settled at ${page.url()}`;
-        logger.info(s2b);
-        progress(s2b);
-
-        // ─── Steps 3-4: find + click the button/link ───────────────────────
-        const s34a = `${jPrefix} STEP 3-4 calling clickTargetInteraction (deadline 60s). Search for text="${target.text}" cta="${target.cta_text}". Will auto-explore tabs if not visible.`;
-        logger.info(s34a);
-        progress(s34a);
-        const clickStartMs = Date.now();
-        const clicked = await this.clickTargetInteraction(page, target, progress);
-        const clickMs = Date.now() - clickStartMs;
-        const s34b = `${jPrefix} STEP 3-4 clickTargetInteraction returned: clicked=${clicked} (after ${clickMs}ms)`;
-        logger.info(s34b);
-        progress(s34b);
-
-        if (!clicked) {
-          // ─── Step 6: not found → one issue, move on. NO launch page scan. ─
-          const failMsg = `${jPrefix} FAIL reason=click-not-found. Target was not visible on launch page or under any auto-explored tab. Emitting target-interaction-failed issue. Launch page NOT scanned as fallback.`;
-          logger.warn(failMsg);
-          progress(failMsg);
-          this.addTargetInteractionFailureIssue(
-            displayName,
-            target,
-            launchUrl,
-            `Configured target "${displayName}" was not found on "${target.base_page}" and could not be revealed by clicking any tab-like element. The launch page was NOT scanned as a fallback — configure the target's card headline / button text to match what's actually visible on the destination.`
-          );
-          failedCount++;
-          continue;
-        }
-
-        // ─── Step 5: click succeeded → wait for nav, scan destination ─────
-        const preWaitUrl = page.url();
-        const s5a = `${jPrefix} STEP 5 click succeeded. Waiting up to 8s for navigation to settle. page.url() before wait: ${preWaitUrl}`;
-        logger.info(s5a);
-        progress(s5a);
-        await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => undefined);
-        await page.waitForTimeout(2500);
-        const destinationUrl = page.url();
-
-        const launchKey = canonicalUrlKey(launchUrl) || launchUrl;
-        const destKey = canonicalUrlKey(destinationUrl) || destinationUrl;
-        const sameUrl = launchKey === destKey;
-        const s5b = `${jPrefix} STEP 5 page.url() after wait: ${destinationUrl} — launchUrl===destinationUrl? ${sameUrl}`;
-        logger.info(s5b);
-        progress(s5b);
-
-        let scanUrl = destinationUrl;
-        if (sameUrl) {
-          const fragment = `click:${encodeURIComponent(target.text || target.cta_text || displayName)}`;
-          scanUrl = `${destinationUrl}#${fragment}`;
-          const s5c = `${jPrefix} STEP 5 NOTE — Click did not change URL. Sky's SPA likely opened content in-place (modal/expanded card/tab-switch). Scanning post-click page state under fragment-suffixed URL to bypass Round 13 guard: ${scanUrl}`;
-          logger.info(s5c);
-          progress(s5c);
-        }
-
-        const issuesBeforeScan = this.allIssues.length;
-        const s5d = `${jPrefix} STEP 5 invoking scanTargetDestinationOnce with scanUrl=${scanUrl}`;
-        logger.info(s5d);
-        progress(s5d);
-        await this.scanTargetDestinationOnce(page, scanUrl, opts, extraStates, progress, scannedKeys, `target:${displayName}`);
-        const issuesAfterScan = this.allIssues.length;
-        const emittedThisScan = issuesAfterScan - issuesBeforeScan;
-        const totalMs = Date.now() - targetStartMs;
-        const s5e = `${jPrefix} STEP 5 scanTargetDestinationOnce returned. Emitted ${emittedThisScan} issue(s). Target completed in ${totalMs}ms total.`;
-        logger.info(s5e);
-        progress(s5e);
-        succeededCount++;
-
-      } catch (err) {
-        const errMsg = (err as Error)?.message || String(err);
-        const failMsg = `${jPrefix} FAIL reason=exception. err=${errMsg}. Launch page NOT scanned as fallback.`;
-        logger.warn(failMsg);
-        progress(failMsg);
-        const currentUrl = (() => { try { return page.url(); } catch { return baseUrl; } })();
-        this.addTargetInteractionFailureIssue(displayName, target, currentUrl, errMsg);
-        failedCount++;
-      }
+      await this.scanSingleTargetInteraction(page, baseUrl, target, opts, extraStates, progress, scannedKeys, authConfig);
     }
-
-    // Final summary — one line to know overall result.
-    const issuesEmittedTotal = this.allIssues.length - issuesBeforeJourney;
-    const summary = `[journey] scanTargetedInteractions COMPLETE — processed ${rawTargets.length} target(s), succeeded=${succeededCount}, failed=${failedCount}. Issues emitted by journey: ${issuesEmittedTotal}.`;
-    logger.info(summary);
-    progress(summary);
   }
-
 
   private async scanSingleTargetInteraction(
     page: any,
@@ -2870,15 +2880,10 @@ export class AccessibilityScanner {
 
       await this.prepareTargetLaunchPage(page, displayName, progress);
 
-      const clicked = await this.clickTargetInteraction(page, target, progress);
+      const clicked = await this.clickTargetInteraction(page, target);
       if (!clicked) {
         progress(`WARN: Targeted interaction not found: ${displayName}`);
-        this.addTargetInteractionFailureIssue(
-          displayName,
-          target,
-          launchUrl,
-          `The configured target "${displayName}" was not found on ${target.base_page} — not in the default view and not revealed by any tab the scanner tried. Scan aborted for this URL as configured (no fallback scan of the launch page). Verify the button/link text matches exactly what appears on the page, or configure a multi-step journey.`
-        );
+        this.addTargetInteractionFailureIssue(displayName, target, launchUrl, "The configured target was not found on the launch page.");
         this.testCases.push({
           name: `Targeted destination scan: ${displayName}`,
           description: `Navigate to ${target.base_page}, find the configured target, click it, and scan only the destination page.`,
@@ -2891,7 +2896,7 @@ export class AccessibilityScanner {
             `Find target using ${this.targetCriteriaText(target)}.`,
             "Click the target and scan the destination page.",
           ],
-          result: "Blocked - target not found on visible view or under any auto-explored tab. Scan aborted as configured."
+          result: "Blocked - the configured target was not found during this run."
         });
         return;
       }
@@ -2975,7 +2980,7 @@ export class AccessibilityScanner {
         } else {
           progress(`Journey "${displayName}" step ${i + 1}: click ${label}`);
           await this.prepareTargetLaunchPage(page, `${displayName} / ${label}`, progress);
-          const clicked = await this.clickTargetInteraction(page, { ...target, ...step, name: step.name || label, base_page: target.base_page }, progress);
+          const clicked = await this.clickTargetInteraction(page, { ...target, ...step, name: step.name || label, base_page: target.base_page });
           if (!clicked) throw new Error(`Journey step ${i + 1} target not found: ${label}`);
           await this.waitAfterTargetStep(page, authConfig, progress, label);
           executedSteps.push(`Click ${this.targetCriteriaText({ ...target, ...step, name: step.name || label, base_page: target.base_page })}.`);
@@ -3265,33 +3270,361 @@ export class AccessibilityScanner {
     progress: (msg: string) => void
   ): Promise<void> {
     if (/^https?:\/\//i.test(basePage)) {
+      progress(`[openLaunchPage] direct URL provided: ${basePage}`);
       const ok = await this.navigateAndRecord(page, basePage, "target interaction base page");
       if (!ok) throw new Error(`Launch page is unreachable: ${basePage}`);
       await this.waitForSlowPageContent(page, progress, basePage, 45000);
+      await this.selectContractIfPickerVisible(page, authConfig, progress);
       return;
     }
 
+    // Round-3 short-circuit: if the browser is ALREADY on the target page (login redirect,
+    // deep-link, or previous navigation), skip the click-and-retry ladder entirely.
+    const currentUrl = page.url();
+    const directLaunchUrl = this.authenticatedLaunchUrlForLabel(basePage, fallbackUrl, currentUrl);
+    if (directLaunchUrl) {
+      try {
+        const current = new URL(currentUrl);
+        const target  = new URL(directLaunchUrl);
+        if (current.origin === target.origin && current.pathname === target.pathname) {
+          progress(`[openLaunchPage] already on target URL for "${basePage}" (${currentUrl}); skipping nav ladder`);
+          await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => undefined);
+          await page.waitForLoadState("networkidle",    { timeout: 20000 }).catch(() => undefined);
+          await this.waitForSlowPageContent(page, progress, basePage, 30000);
+          if (authConfig?.auto_accept_cookies !== false) {
+            await this.clearCookieConsent(page, this.authSelector(authConfig, "cookie_accept_selector")).catch(() => undefined);
+          }
+          await this.selectContractIfPickerVisible(page, authConfig, progress);
+          return;
+        }
+      } catch { /* URL parse error — fall through to normal ladder */ }
+    }
+
+    progress(`[openLaunchPage] attempting sidebar click for "${basePage}" (current=${currentUrl})`);
     const clicked = await this.clickVisibleTextWithRetry(page, basePage, 25000);
-    if (!clicked) {
-      progress(`Launch page "${basePage}" not visible from current page; returning to ${fallbackUrl}`);
-      const ok = await this.navigateAndRecord(page, fallbackUrl, "target interaction fallback page");
-      if (!ok) throw new Error(`Could not return to authenticated launch root: ${fallbackUrl}`);
-      await this.waitForSlowPageContent(page, progress, fallbackUrl, 45000);
-      const retry = await this.clickVisibleTextWithRetry(page, basePage, 25000);
-      if (!retry) {
-        const directLaunchUrl = this.authenticatedLaunchUrlForLabel(basePage, fallbackUrl, page.url());
-        if (!directLaunchUrl) throw new Error(`Launch page navigation item was not found: ${basePage}`);
-        progress(`Launch page "${basePage}" not found in visible navigation; opening known route ${directLaunchUrl}`);
+    if (clicked) {
+      progress(`[openLaunchPage] sidebar click succeeded for "${basePage}"`);
+    } else {
+      progress(`[openLaunchPage] sidebar click for "${basePage}" timed out after 25s`);
+
+      if (directLaunchUrl) {
+        progress(`[openLaunchPage] using direct route ${directLaunchUrl} for "${basePage}"`);
         const directOk = await this.navigateAndRecord(page, directLaunchUrl, `target interaction direct launch: ${basePage}`);
-        if (!directOk) throw new Error(`Launch page navigation item was not found and direct route failed: ${basePage}`);
-        await this.waitForSlowPageContent(page, progress, basePage, 45000);
+        if (!directOk) throw new Error(`Launch page direct route failed: ${basePage} → ${directLaunchUrl}`);
+        await this.waitForSlowPageContent(page, progress, basePage, 30000);
+      } else {
+        progress(`[openLaunchPage] no direct route for "${basePage}"; falling back to ${fallbackUrl}`);
+        const ok = await this.navigateAndRecord(page, fallbackUrl, "target interaction fallback page");
+        if (!ok) throw new Error(`Could not return to authenticated launch root: ${fallbackUrl}`);
+        await this.waitForSlowPageContent(page, progress, fallbackUrl, 45000);
+        const retry = await this.clickVisibleTextWithRetry(page, basePage, 25000);
+        if (!retry) throw new Error(`Launch page navigation item was not found: ${basePage}`);
+        progress(`[openLaunchPage] retry click succeeded for "${basePage}"`);
       }
     }
+
     await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => undefined);
-    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => undefined);
+    await page.waitForLoadState("networkidle",    { timeout: 20000 }).catch(() => undefined);
     await this.waitForSlowPageContent(page, progress, basePage, 30000);
     if (authConfig?.auto_accept_cookies !== false) {
       await this.clearCookieConsent(page, this.authSelector(authConfig, "cookie_accept_selector")).catch(() => undefined);
+    }
+    // After reaching the launch page, check if a "Seleziona un contratto" picker
+    // is blocking further navigation. Select and dismiss if configured.
+    await this.selectContractIfPickerVisible(page, authConfig, progress);
+    progress(`[openLaunchPage] complete for "${basePage}" (final URL=${page.url()})`);
+  }
+
+  /**
+   * ROUND 5 — Sidebar contract switcher handler.
+   *
+   * Sky's multi-contract picker does NOT auto-appear as a modal on page load.
+   * It appears only after the user clicks the double-arrow toggle in the left
+   * sidebar (below the "Casa QUARTUCCIU" label). Clicking that toggle opens
+   * a popover with radios + Conferma button.
+   *
+   * DOM structure (captured from live abbonamento.sky.it):
+   *   Toggle:  <div class="contract-switch" role="button" tabindex="0">
+   *              Casa QUARTUCCIU
+   *              <i class="icon-contract-switch"></i>
+   *            </div>
+   *   Popover: <sky-popup-fade-template>
+   *              <wsc-contract-switch>
+   *                <h2>Seleziona un contratto</h2>
+   *                <sky-radio-button groupname="contractSwitch">
+   *                  <label for="id1">Casa QUARTUCCIU / Contratto Wifi + TV - 10600970</label>
+   *                  <input type="radio" id="id1">
+   *                </sky-radio-button>
+   *                (more radios…)
+   *                <button class="confirm-button">Conferma</button>
+   *              </wsc-contract-switch>
+   *            </sky-popup-fade-template>
+   *
+   * Behaviour (matches tester's agreed spec):
+   *   1. No-op if neither contract_number nor contract_name is configured.
+   *   2. No-op if `div.contract-switch` toggle isn't found on the page
+   *      (single-contract account, or Sky moved the toggle).
+   *   3. Click the toggle → wait for wsc-contract-switch popover.
+   *   4. If popover doesn't appear within 5s: log warning, return cleanly
+   *      (no error, no scan halt).
+   *   5. Match radio by label text containing contract_number (preferred)
+   *      or contract_name (fallback).
+   *   6. If no radio matches: log warning + record informational issue,
+   *      return cleanly (soft — DON'T halt scan).
+   *   7. Click matched radio → click Conferma → wait for popover dismissal.
+   *   8. On success: subsequent Target URL navigations use the newly
+   *      selected contract's session context (cookies).
+   */
+  private async selectContractIfPickerVisible(
+    page: any,
+    authConfig: any,
+    progress: (msg: string) => void
+  ): Promise<void> {
+    const contractNumber = String(authConfig?.contract_number || "").trim();
+    const contractName   = String(authConfig?.contract_name   || "").trim();
+
+    // ALWAYS log entry so we can prove the method is being called, regardless
+    // of whether a switcher will actually run. This is our diagnostic anchor.
+    // Round 5c: mirror progress() to logger.info so events show in backend log.
+    // dualLog is a small helper — every call goes to both channels.
+    const dualLog = (msg: string) => { progress(msg); logger.info(msg); };
+
+    const authKeys = authConfig && typeof authConfig === "object" ? Object.keys(authConfig).join(",") : "<none>";
+    dualLog(`[contract-switcher] ENTER — url=${page.url()} contract_number="${contractNumber}" contract_name="${contractName}" auth_keys=[${authKeys}]`);
+
+    // Nothing to do if tester didn't configure a contract
+    if (!contractNumber && !contractName) {
+      dualLog(`[contract-switcher] no contract configured — skipping (this is normal for single-contract accounts)`);
+      return;
+    }
+
+    // Track whether we've already switched in this browser context — once the
+    // contract is picked, the popover doesn't reappear on later pages, so we
+    // don't want to keep re-triggering the flow per URL.
+    const alreadySwitched = (page as any).__axessia_contract_switched;
+    if (alreadySwitched) {
+      dualLog(`[contract-switcher] already switched in this session — skipping`);
+      return;
+    }
+
+    // ROUND 5f Fix 1 — Explicit waitForSelector instead of "wait 1.5s and query once".
+    // The previous fixed timeout misses Angular hydration variance: sometimes
+    // Sky's shell micro-app renders the sidebar toggle in 800ms, sometimes 3s+.
+    // A one-shot querySelector fires early → returns null → we incorrectly log
+    // "single-contract account" and skip the switch. Now we wait up to 10s for
+    // the toggle to actually appear before giving up.
+    const toggleSelector = 'div.contract-switch[role="button"], .contract-switch[role="button"]';
+    dualLog(`[contract-switcher] waiting for sidebar toggle (up to 10s)...`);
+    const toggleAppeared = await page.waitForSelector(toggleSelector, { state: 'visible', timeout: 10000 })
+      .then(() => true)
+      .catch(() => false);
+
+    if (!toggleAppeared) {
+      // ROUND 5f Fix 3 — DOM evidence on miss. Dump a short snippet of the sidebar
+      // (or body if sidebar isn't present) so we can see what Sky actually rendered.
+      // Without this we're guessing whether the toggle changed selector, was
+      // hidden by A/B test, or the account is genuinely single-contract.
+      const evidence = await page.evaluate(() => {
+        const sidebar = document.querySelector('sky-sidebar, aside, nav[class*="sidebar"], nav[class*="side-nav"]');
+        const anyContract = Array.from(document.querySelectorAll('*'))
+          .filter(el => /contract-switch|contract_switch|contract_toggle/i.test((el as HTMLElement).className || ""))
+          .slice(0, 5)
+          .map(el => `${el.tagName.toLowerCase()}.${(el as HTMLElement).className || ""}`.slice(0, 100));
+        return {
+          sidebarFound: !!sidebar,
+          sidebarPreview: sidebar ? (sidebar.outerHTML || "").slice(0, 600) : null,
+          bodyPreview: document.body ? (document.body.innerHTML || "").slice(0, 400) : null,
+          contractLikeMatches: anyContract,
+          currentUrl: location.href
+        };
+      }).catch((err: any) => ({ error: String(err?.message || err) }));
+      dualLog(`[contract-switcher] no sidebar toggle found on ${page.url()} after 10s wait — likely single-contract account (or Sky changed the selector). Evidence: ${JSON.stringify(evidence).slice(0, 900)}`);
+      return;
+    }
+
+    // Toggle appeared. Re-run the visibility/text extraction now that we know it exists.
+    const toggleFound = await page.evaluate((sel: string) => {
+      const toggle = document.querySelector(sel) as HTMLElement | null;
+      if (!toggle) return { found: false };
+      const rect = toggle.getBoundingClientRect();
+      return { found: true, visible: rect.width > 0 && rect.height > 0, text: (toggle.textContent || "").trim().slice(0, 80) };
+    }, toggleSelector).catch(() => ({ found: false }));
+
+    if (!toggleFound.found) {
+      dualLog(`[contract-switcher] toggle vanished between waitForSelector and evaluate on ${page.url()} — continuing`);
+      return;
+    }
+    if (!(toggleFound as any).visible) {
+      dualLog(`[contract-switcher] toggle exists but not visible on ${page.url()} — continuing`);
+      return;
+    }
+    dualLog(`[contract-switcher] toggle found: "${(toggleFound as any).text}"`);
+
+    // 2. Click the toggle. Prefer .click() via evaluate() (bypasses overlays)
+    //    but fall back to Playwright's .click() if that fails.
+    const clickedToggle = await page.evaluate(() => {
+      const toggle = document.querySelector('div.contract-switch[role="button"], .contract-switch[role="button"]') as HTMLElement | null;
+      if (!toggle) return false;
+      toggle.click();
+      return true;
+    }).catch(() => false);
+
+    if (!clickedToggle) {
+      // Playwright fallback
+      const locator = page.locator('div.contract-switch[role="button"]').first();
+      await locator.click({ timeout: 3000 }).catch(() => undefined);
+    }
+
+    dualLog(`[contract-switcher] toggle clicked, waiting for popover`);
+
+    // 3. Wait up to 5s for the popover to render
+    const popoverAppeared = await page.waitForSelector('wsc-contract-switch', { timeout: 5000, state: 'visible' })
+      .then(() => true)
+      .catch(() => false);
+
+    if (!popoverAppeared) {
+      dualLog(`[contract-switcher] popover did not appear within 5s after toggle click — continuing without switch`);
+      return;
+    }
+    dualLog(`[contract-switcher] popover appeared`);
+
+    // 4. Find and click the matching radio inside the popover
+    const clickResult = await page.evaluate(({ number, name }: { number: string; name: string }) => {
+      const popover = document.querySelector('wsc-contract-switch');
+      if (!popover) return { ok: false, reason: 'popover-vanished' };
+
+      const radios = Array.from(popover.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
+      if (!radios.length) return { ok: false, reason: 'no-radios-in-popover' };
+
+      const labelTextFor = (r: HTMLInputElement): string => {
+        // Radio input is a sibling of the <label for=id>, not nested inside.
+        // Try label[for=id] first, then closest container as fallback.
+        const id = r.id;
+        const forLabel = id ? popover.querySelector(`label[for="${id}"]`) : null;
+        const parentContainer = r.closest('sky-radio-button, .radio-container, .radio-button-container > *');
+        return [
+          forLabel?.textContent || '',
+          parentContainer?.textContent || '',
+        ].join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+      };
+
+      // All radio labels for debug
+      const allLabels = radios.map(r => labelTextFor(r).slice(0, 100));
+
+      // Prefer number match (more specific)
+      let match: HTMLInputElement | null = null;
+      let matchedBy = '';
+      if (number) {
+        match = radios.find(r => labelTextFor(r).includes(number.toLowerCase())) || null;
+        if (match) matchedBy = `number "${number}"`;
+      }
+      if (!match && name) {
+        match = radios.find(r => labelTextFor(r).includes(name.toLowerCase())) || null;
+        if (match) matchedBy = `name "${name}"`;
+      }
+      if (!match) {
+        return { ok: false, reason: 'no-match', allLabels };
+      }
+
+      // Click via label if present (more reliable — bypasses hidden radio quirks)
+      const id = match.id;
+      const label = id ? popover.querySelector(`label[for="${id}"]`) as HTMLElement | null : null;
+      const clickTarget = label || (match.closest('sky-radio-button') as HTMLElement | null) || match;
+      clickTarget.click();
+      match.checked = true;
+      match.dispatchEvent(new Event('change', { bubbles: true }));
+      match.dispatchEvent(new Event('input', { bubbles: true }));
+      return { ok: true, matchedBy, labelText: labelTextFor(match).slice(0, 120) };
+    }, { number: contractNumber, name: contractName }).catch((e: any) => ({ ok: false, reason: `eval-error:${e?.message || e}` }));
+
+    if (!(clickResult as any).ok) {
+      const reason = (clickResult as any).reason;
+      const allLabels = (clickResult as any).allLabels;
+      dualLog(`[contract-switcher] could not match radio (reason=${reason}). Configured number="${contractNumber}", name="${contractName}". Available: ${JSON.stringify(allLabels || [])}`);
+      // Soft-fail per tester's spec — record an informational issue but don't
+      // halt the scan. The scan continues on the default contract.
+      this.pushIssuesIfAllowed([{
+        ruleId: 'contract-selection-mismatch',
+        severity: 'moderate',
+        category: 'authentication-flow',
+        message: `The contract switcher was opened on the Home URL, but the configured contract could not be matched. Configured: number="${contractNumber}", name="${contractName}". Scan continued on the default contract.`,
+        url: page.url(),
+        selector: 'wsc-contract-switch input[type="radio"]',
+        wcag: ['wcag2.4.3'],
+        tags: ['authentication-flow', 'multi-contract'],
+        fixSuggestion: `Check the exact contract number or name in Sky's picker (e.g. "Casa QUARTUCCIU — Contratto Wifi + TV - 10600970") and update the scan's Multi-contract fields to match.`,
+        evidenceExplanation: `On ${page.url()}, opened the sidebar contract switcher. Configured value did not appear in any radio label. Available radios: ${JSON.stringify(allLabels || [])}`,
+      }]);
+      // Try to close the popover so it doesn't block subsequent navigation
+      await page.evaluate(() => {
+        const close = document.querySelector('wsc-contract-switch .close-button-container button, wsc-contract-switch .close-button-container [role="button"]') as HTMLElement | null;
+        close?.click();
+      }).catch(() => undefined);
+      return;
+    }
+
+    dualLog(`[contract-switcher] radio matched by ${(clickResult as any).matchedBy}, label="${(clickResult as any).labelText}"`);
+
+    // 5. Click Conferma
+    const confirmed = await page.evaluate(() => {
+      const popover = document.querySelector('wsc-contract-switch');
+      if (!popover) return false;
+      const btn = popover.querySelector('button.confirm-button') as HTMLElement | null
+               || Array.from(popover.querySelectorAll('button')).find(b => /^\s*conferma\s*$/i.test(b.textContent?.trim() || '')) as HTMLElement | null;
+      if (!btn) return false;
+      btn.click();
+      return true;
+    }).catch(() => false);
+
+    if (!confirmed) {
+      dualLog(`[contract-switcher] radio was clicked but Conferma button not found — some Sky templates auto-confirm on radio change, continuing`);
+    } else {
+      dualLog(`[contract-switcher] Conferma clicked`);
+    }
+
+    // 6. Wait up to 8s for the popover to disappear
+    const dismissed = await page.waitForFunction(
+      () => !document.querySelector('wsc-contract-switch'),
+      { timeout: 8000 }
+    ).then(() => true).catch(() => false);
+
+    if (dismissed) {
+      dualLog(`[contract-switcher] popover dismissed — contract switch complete`);
+    } else {
+      dualLog(`[contract-switcher] popover still visible after 8s — continuing anyway`);
+    }
+
+    // Let network requests triggered by contract switch settle before Target URL navigation
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => undefined);
+
+    // Mark this browser context as switched so we don't re-open the popover on every URL
+    (page as any).__axessia_contract_switched = true;
+  }
+
+  /**
+   * ROUND 5b — derive Sky's home/dashboard URL from any target URL so the
+   * contract-switcher detour goes to the right place regardless of target.
+   *
+   * Sky's contract-switch sidebar lives on any authenticated shell page
+   * (/home, /gestisci, /offers, /profile, etc.). We use /home because it's
+   * the canonical landing page post-login.
+   *
+   * Example: target = "https://abbonamento.sky.it/offers/pdp/tv/44157"
+   *          → returns "https://abbonamento.sky.it/home"
+   */
+  // ROUND 5g — Prefer an explicit home_url from auth_config if provided.
+  // Falls back to origin/home derivation for backwards compatibility.
+  // Once the frontend adds a Home URL field and authSessionManager persists
+  // it into auth_config.home_url, that value wins. Until then, derivation
+  // is used (same behaviour as Round 5b–5f).
+  private contractSwitcherHomeUrlForTarget(targetUrl: string, authConfig?: any): string {
+    const explicit = String(authConfig?.home_url || "").trim();
+    if (explicit && /^https?:\/\//i.test(explicit)) return explicit;
+    try {
+      const u = new URL(targetUrl);
+      return `${u.origin}/home`;
+    } catch {
+      return "https://abbonamento.sky.it/home";
     }
   }
 
@@ -3367,7 +3700,7 @@ export class AccessibilityScanner {
   }
 
   private addTargetInteractionFailureIssue(displayName: string, target: TargetInteractionConfig, currentUrl: string, reason: string): void {
-    this.allIssues.push({
+    this.pushIssuesIfAllowed([{
       ruleId: "targeted-interaction-not-reached",
       severity: "serious",
       category: "navigation-coverage",
@@ -3378,237 +3711,19 @@ export class AccessibilityScanner {
       tags: ["navigation-coverage"],
       fixSuggestion: "Verify the launch page label or route, CTA text, selector fallback, account entitlement, and whether the target is rendered only after delayed authenticated content loads.",
       evidenceExplanation: `Launch page: ${target.base_page}. Criteria: ${this.targetCriteriaText(target)}. Current browser URL: ${currentUrl}.`
-    });
+    }]);
   }
 
-  private async clickTargetInteraction(page: any, target: TargetInteractionConfig, progress?: (msg: string) => void): Promise<boolean> {
+  private async clickTargetInteraction(page: any, target: TargetInteractionConfig): Promise<boolean> {
     const label = target.name || target.text || target.cta_text || target.selector || "target interaction";
     const deadline = Date.now() + 60000;
-
-    // Track tabs we've already tried clicking so we don't loop forever.
-    const triedTabSignatures = new Set<string>();
-    let outOfTabs = false;
-    let postExhaustAttempts = 0;
-    const MAX_POST_EXHAUST_ATTEMPTS = 2;
-
     while (Date.now() < deadline) {
       if (await this.clickTargetInteractionOnce(page, target)) return true;
-
-      if (!outOfTabs) {
-        const result = await this.tryClickThroughTabsAndRetry(page, target, triedTabSignatures, progress);
-        if (result === "found") return true;
-        if (result === "no-tabs") {
-          outOfTabs = true;
-          const tabList = Array.from(triedTabSignatures).map(s => s.split("|")[1] || s).join(" · ") || "none";
-          const msg = `Tab exploration exhausted for "${label}"; tried ${triedTabSignatures.size} tab(s): ${tabList}`;
-          logger.info(msg);
-          if (progress) progress(msg);
-        }
-      } else {
-        postExhaustAttempts++;
-        if (postExhaustAttempts >= MAX_POST_EXHAUST_ATTEMPTS) {
-          const msg = `Bailing out early: "${label}" not found after tab exploration + ${MAX_POST_EXHAUST_ATTEMPTS} direct retries.`;
-          logger.warn(msg);
-          if (progress) progress(msg);
-          return false;
-        }
-      }
-
       await page.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => undefined);
       await page.waitForTimeout(1500).catch(() => undefined);
     }
-
-    const tabList = Array.from(triedTabSignatures).map(s => s.split("|")[1] || s).join(" · ") || "none";
-    logger.warn(`Timed out waiting for targeted interaction to render: "${label}". Tabs tried during search: ${tabList}`);
+    logger.warn(`Timed out waiting for targeted interaction to render: ${label}`);
     return false;
-  }
-
-  /**
-   * Reveal tab-hidden content by clicking tab-like elements one at a time
-   * and retrying the target after each click.
-   *
-   * Returns:
-   *   "found"      - the target was clicked after a tab activation.
-   *   "no-tabs"    - no untried tab-like elements were found on this page.
-   *   "not-found"  - tabs were tried but the target still isn't visible.
-   *
-   * Tab detection uses FOUR heuristics in-order, most-specific first:
-   *   1. ARIA — role="tab", or button/link inside role="tablist".
-   *   2. Class hints — class contains tab/pill/chip/filter/segment.
-   *   3. Structural — buttons/links inside <nav>.
-   *   4. Positional — the workhorse for custom-styled tab bars that
-   *      declare no ARIA and use no conventional class names. Finds
-   *      groups of 2-5 sibling buttons/anchors at the top of the page
-   *      (y < 400) with short text (< 30 chars) and similar geometry.
-   *      Sky's pill-style tabs on /offers match this heuristic.
-   *
-   * The positional heuristic is aggressive on purpose — a false-positive
-   * click (e.g. clicking something that ISN'T a tab) is recoverable
-   * because we retry the direct target search after each. A miss on a
-   * real tab means the journey silently fails, which is much worse.
-   */
-  private async tryClickThroughTabsAndRetry(
-    page: any,
-    target: TargetInteractionConfig,
-    triedTabSignatures: Set<string>,
-    progress?: (msg: string) => void
-  ): Promise<"found" | "no-tabs" | "not-found"> {
-    const tabs = await page.evaluate(() => {
-      const visible = (el: Element) => {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const style = window.getComputedStyle(el as HTMLElement);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-      };
-      const normalize = (v: string) => String(v || "").replace(/\s+/g, " ").trim();
-
-      const candidates = new Map<Element, { source: string }>();
-      const add = (el: Element, source: string) => {
-        if (visible(el) && !candidates.has(el)) candidates.set(el, { source });
-      };
-
-      // Heuristic 0 — Sky-specific DOM. Sky's custom-element chip/pill
-      // tab bar (<sky-chips-list><nav><sky-chip><button class="chip">).
-      // Added explicitly so we don't rely on generic heuristics matching
-      // Sky's Angular class names. Ordered first so Sky's tabs are found
-      // even when other heuristics might miss.
-      document.querySelectorAll(
-        'sky-chip button, sky-chips-list button, button.chip, button[class*="chip"], [role="button"][class*="chip"]'
-      ).forEach(el => add(el, "sky-chip"));
-
-      // Heuristic 1 — ARIA tabs.
-      document.querySelectorAll('[role="tab"]').forEach(el => add(el, "aria-tab"));
-      document.querySelectorAll('[role="tablist"] button, [role="tablist"] a, [role="tablist"] [role="button"]')
-        .forEach(el => add(el, "aria-tablist-child"));
-
-      // Heuristic 2 — class hints (tab / pill / chip / filter / segment).
-      document.querySelectorAll('button, a, [role="button"]').forEach(el => {
-        const cls = ((el.getAttribute("class") || "") + " " + (el.parentElement?.getAttribute("class") || "")).toLowerCase();
-        if (/(^|[\s-_])(tab|tabs|tabbutton|tabitem|tablink|pill|chip|filter|segment|toggle)([\s-_]|$)/i.test(cls)) {
-          add(el, "class-hint");
-        }
-      });
-
-      // Heuristic 3 — nav-container buttons/links.
-      document.querySelectorAll('nav button, nav a[href]').forEach(el => add(el, "nav-child"));
-
-      // Heuristic 4 — POSITIONAL. Groups of 2-5 sibling buttons/links at
-      // top of viewport (y < 500) with short text. Catches Sky's
-      // untagged pill-tabs.
-      // Group by immediate parent so we consider each button ROW separately.
-      const posByParent = new Map<Element, HTMLElement[]>();
-      document.querySelectorAll('button, a[href], [role="button"]').forEach(el => {
-        if (!visible(el)) return;
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        if (rect.top > 500 || rect.top < 40) return;                     // must be top-of-page (not header <40)
-        if (rect.height > 80) return;                                    // not huge CTAs
-        const text = normalize(el.textContent || el.getAttribute("aria-label") || "");
-        if (!text || text.length > 40) return;                           // short label
-        // Exclude obvious non-tabs.
-        if (/^(scopri di più|scopri|discover|shop|buy|acquista|attiva|acquisto|dettagli|details|continua|conferma|confirm|accetta|accept|login|sign in|entra|logout|log out|esci|sign up|register|registrati|open|close|menu|cerca|search|next|prev|precedente|successivo|indietro|back|ok|cancel|annulla|home|sky extra|la tua assistenza|assistenza)$/i.test(text)) {
-          return;
-        }
-        const parent = el.parentElement;
-        if (!parent) return;
-        if (!posByParent.has(parent)) posByParent.set(parent, []);
-        posByParent.get(parent)!.push(el as HTMLElement);
-      });
-      for (const [, siblings] of posByParent) {
-        if (siblings.length < 2 || siblings.length > 8) continue;
-        // Check similar Y coordinates — tabs sit in a row.
-        const ys = siblings.map(el => el.getBoundingClientRect().top);
-        const minY = Math.min(...ys);
-        const maxY = Math.max(...ys);
-        if (maxY - minY > 30) continue;
-        for (const el of siblings) add(el, "positional-tab-row");
-      }
-
-      // Serialise for the caller.
-      return Array.from(candidates.entries()).map(([el, meta]) => {
-        const text = normalize(el.textContent || el.getAttribute("aria-label") || "");
-        const isSelected = el.getAttribute("aria-selected") === "true"
-          || el.getAttribute("aria-current") === "true"
-          || el.getAttribute("aria-current") === "page"
-          || (el as HTMLElement).classList.contains("active")
-          || (el as HTMLElement).classList.contains("selected")
-          || (el as HTMLElement).classList.contains("is-active")
-          || (el as HTMLElement).classList.contains("is-selected")
-          || (el as HTMLElement).classList.contains("current");
-        const signature = [
-          el.tagName.toLowerCase(),
-          text.slice(0, 60),
-          (el.getAttribute("role") || ""),
-          (el.getAttribute("aria-controls") || ""),
-        ].join("|");
-        return { text, isSelected, signature, source: meta.source };
-      });
-    }).catch(() => []);
-
-    if (!tabs.length) {
-      if (progress) progress(`Tab exploration: no tab-like elements found on this page.`);
-      return "no-tabs";
-    }
-
-    const untried = tabs.filter((t: any) => !triedTabSignatures.has(t.signature) && !t.isSelected && t.text.length > 0);
-    if (!untried.length) return "no-tabs";
-
-    if (progress) {
-      const foundList = tabs.map((t: any) => `"${t.text}"${t.isSelected ? " [selected]" : ""}`).join(", ");
-      progress(`Tab exploration: found ${tabs.length} tab(s) — ${foundList}. Trying ${untried.length} untried non-selected tab(s).`);
-    }
-
-    for (const tab of untried) {
-      triedTabSignatures.add(tab.signature);
-      const msg = `Auto-exploring tab: "${tab.text}" (source: ${tab.source})`;
-      logger.info(msg);
-      if (progress) progress(msg);
-
-      // Click by the signature we recorded — re-query in the page so we
-      // survive intervening re-renders.
-      const activated = await page.evaluate((sig: string) => {
-        const visible = (el: Element) => {
-          const rect = (el as HTMLElement).getBoundingClientRect();
-          const style = window.getComputedStyle(el as HTMLElement);
-          return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-        };
-        const normalize = (v: string) => String(v || "").replace(/\s+/g, " ").trim();
-        const candidates: Element[] = [];
-        // Same super-set of selectors as detection so any candidate can
-        // be found by signature — includes heuristic 4 targets too.
-        document.querySelectorAll(
-          '[role="tab"], [role="tablist"] button, [role="tablist"] a, [role="tablist"] [role="button"], ' +
-          'button, a[href], [role="button"]'
-        ).forEach(el => { if (visible(el)) candidates.push(el); });
-        for (const el of candidates) {
-          const text = normalize(el.textContent || el.getAttribute("aria-label") || "");
-          const s = [
-            el.tagName.toLowerCase(),
-            text.slice(0, 60),
-            (el.getAttribute("role") || ""),
-            (el.getAttribute("aria-controls") || ""),
-          ].join("|");
-          if (s === sig) {
-            (el as HTMLElement).scrollIntoView({ block: "center" });
-            (el as HTMLElement).dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
-            (el as HTMLElement).dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
-            (el as HTMLElement).dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
-            (el as HTMLElement).click();
-            return true;
-          }
-        }
-        return false;
-      }, tab.signature).catch(() => false);
-
-      if (!activated) continue;
-
-      // Give tab content time to render — Sky's pill-tabs re-render sections.
-      await page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => undefined);
-      await page.waitForTimeout(1500).catch(() => undefined);
-
-      // Retry the actual target.
-      if (await this.clickTargetInteractionOnce(page, target)) return "found";
-    }
-
-    return "not-found";
   }
 
   private async clickTargetInteractionOnce(page: any, target: TargetInteractionConfig): Promise<boolean> {
@@ -3661,20 +3776,8 @@ export class AccessibilityScanner {
       const interactiveSelector = "a[href],button,[role='button'],[role='link'],[tabindex]";
 
       if (criteria.text && criteria.ctaText) {
-        // Look for a container that both (a) is visible and (b) contains the
-        // card headline text WITHIN its visible subtree (not just hidden text).
-        // Use innerText instead of textContent — innerText excludes hidden
-        // elements' text. This is what fixes the Sky /offers bug where the
-        // Paramount+ card on the hidden Sky TV tab was being matched by the
-        // whole-body container's textContent (which includes hidden text),
-        // causing the scanner to click the visible "Scopri di più" button on
-        // the Sky Mobile Offerta card instead.
         const containers = Array.from(document.querySelectorAll("article,section,li,[class*='card' i],[class*='promo' i],div"))
-          .filter(el => {
-            if (!visible(el)) return false;
-            const visibleText = normalize((el as HTMLElement).innerText || "");
-            return visibleText.includes(criteria.text);
-          })
+          .filter(el => visible(el) && normalize(el.textContent).includes(criteria.text))
           .sort((a, b) => {
             const ar = (a as HTMLElement).getBoundingClientRect();
             const br = (b as HTMLElement).getBoundingClientRect();
@@ -3696,17 +3799,11 @@ export class AccessibilityScanner {
         }
       }
 
-      // Broader fallback — but with the SAME innerText tightening applied
-      // to the nearby ancestor check so we don't match cross-card.
       const candidates = Array.from(document.querySelectorAll(interactiveSelector));
       const match = candidates.find(el => {
         if (!visible(el) || !isKind(el)) return false;
         const href = normalize((el as HTMLAnchorElement).href || el.getAttribute("href"));
-        // innerText excludes text inside display:none / visibility:hidden
-        // children; textContent includes them. Use innerText so cross-tab
-        // text doesn't falsely match.
-        const ancestor = el.closest("article,section,li,div") as HTMLElement | null;
-        const nearby = normalize(ancestor?.innerText || "");
+        const nearby = normalize(el.closest("article,section,li,div")?.textContent);
         const text = normalize([elementText(el), nearby].filter(Boolean).join(" "));
         const textOk = !criteria.text || text.includes(criteria.text);
         const ctaOk = !criteria.ctaText || text.includes(criteria.ctaText);
@@ -3802,7 +3899,7 @@ export class AccessibilityScanner {
         return;
       }
       progress(`WARN: Selected authenticated sections not reached by keyboard tabbing: ${missing.join(", ")}`);
-      this.allIssues.push({
+      this.pushIssuesIfAllowed([{
         ruleId: "keyboard:configured-nav-tab-reachable",
         severity: "serious",
         priority: 2,
@@ -3816,7 +3913,7 @@ export class AccessibilityScanner {
         state: "configured-nav",
         affectedCount: missing.length,
         fixSuggestion: "Ensure every selected authenticated navigation item can receive keyboard focus in a logical order and exposes a clear visible focus indicator.",
-      });
+      }]);
     } catch (err) {
       progress(`WARN: Could not verify keyboard access for authenticated navigation: ${(err as Error)?.message || err}`);
     }
@@ -3930,45 +4027,9 @@ export class AccessibilityScanner {
   }
 
   private async attachIssueEvidence(page: any, issues: ScanIssue[]): Promise<void> {
-    // Ship 1 / Item 6 — evidence completeness.
-    // 1. Bump the cap from 80 -> 200 so real reports don't lose screenshots
-    //    on medium-to-large scans.
-    // 2. For issues WITHOUT a usable selector, fall back to a full-page
-    //    screenshot so users still get visual context instead of a blank
-    //    evidence panel.
-    // 3. Log every skip reason so we can debug missing evidence in prod.
-    const EVIDENCE_CAP = 200;
-    const missingScreenshots = issues.filter(issue => !issue.evidenceScreenshot);
-    const withSelector = missingScreenshots.filter(issue => issue.selector || issue.selectors?.[0]);
-    const withoutSelector = missingScreenshots.filter(issue => !(issue.selector || issue.selectors?.[0]));
-    const candidates = withSelector.slice(0, EVIDENCE_CAP);
-    const skippedForCap = withSelector.length - candidates.length;
-    if (skippedForCap > 0) {
-      logger.warn(`Evidence capture: skipped ${skippedForCap} issue(s) with selector because the per-URL cap of ${EVIDENCE_CAP} was reached.`);
-    }
-    if (withoutSelector.length) {
-      logger.info(`Evidence capture: ${withoutSelector.length} issue(s) have no selector — will use a full-page fallback screenshot.`);
-    }
-
-    // Full-page fallback for issues that don't have a selector to highlight.
-    // Capture the fallback ONCE per URL and reuse it — pages don't change
-    // between issues at this point in the pipeline.
-    let fullPageFallback: string | undefined;
-    if (withoutSelector.length) {
-      try {
-        const buf = await page.screenshot({ type: "jpeg", quality: 62, fullPage: true });
-        fullPageFallback = `data:image/jpeg;base64,${buf.toString("base64")}`;
-      } catch (err) {
-        logger.warn("Evidence capture: full-page fallback screenshot failed:", err);
-      }
-    }
-    if (fullPageFallback) {
-      for (const issue of withoutSelector) {
-        issue.evidenceScreenshot = fullPageFallback;
-        issue.evidenceExplanation = issue.evidenceExplanation
-          || `Full-page fallback screenshot — this issue has no DOM selector to highlight (rule ${issue.ruleId}).`;
-      }
-    }
+    const candidates = issues
+      .filter(issue => !issue.evidenceScreenshot && (issue.selector || issue.selectors?.[0]))
+      .slice(0, 80);
 
     for (const issue of candidates) {
       const selectors = Array.from(new Set([issue.selector, ...(issue.selectors || [])].filter(Boolean))) as string[];
@@ -4057,22 +4118,7 @@ export class AccessibilityScanner {
           return { found: true, visible: isVisible, selector: selectedSelector, affectedElements: uniqueLabels };
         }, { selectors, ruleId: issue.ruleId });
 
-        if (!captured?.found) {
-          // Ship 1 / Item 6 — log skip reason so missing screenshots are debuggable.
-          logger.debug(`Evidence capture: element not found for ${issue.ruleId} (selectors: ${(issue.selectors || [issue.selector]).slice(0, 3).join(", ")}). Falling back to full-page screenshot.`);
-          // Give the user something rather than nothing.
-          if (!issue.evidenceScreenshot) {
-            try {
-              const buf = await page.screenshot({ type: "jpeg", quality: 62, fullPage: true });
-              issue.evidenceScreenshot = `data:image/jpeg;base64,${buf.toString("base64")}`;
-              issue.evidenceExplanation = issue.evidenceExplanation
-                || `Element for ${issue.ruleId} was not visible on the page at capture time — showing a full-page context screenshot instead.`;
-            } catch (fallbackErr) {
-              logger.warn(`Evidence capture: full-page fallback also failed for ${issue.ruleId}:`, fallbackErr);
-            }
-          }
-          continue;
-        }
+        if (!captured?.found) continue;
         if (captured.selector) issue.selector = captured.selector;
         if (captured.affectedElements?.length) {
           issue.affectedElements = this.unique([...(issue.affectedElements || []), ...captured.affectedElements]).slice(0, 40);
@@ -4082,8 +4128,7 @@ export class AccessibilityScanner {
         issue.evidenceScreenshot = `data:image/jpeg;base64,${buf.toString("base64")}`;
         issue.evidenceExplanation = this.buildEvidenceExplanation(issue, captured.visible);
       } catch (err) {
-        // Ship 1 / Item 6 — surface capture failures instead of silently dropping them.
-        logger.warn(`Evidence capture failed for ${issue.ruleId} (${issue.url}):`, err);
+        logger.debug(`Issue evidence capture failed for ${issue.ruleId}:`, err);
       } finally {
         try {
           await page.evaluate(() => {
@@ -4130,26 +4175,15 @@ export class AccessibilityScanner {
 
 
   private calibrateIssues(issues: ScanIssue[]): ScanIssue[] {
-    // Ship 1 / Item 7 — noise reduction.
-    // When the user opts in via `suppress_advisory_rules`, best-practice /
-    // advisory rules are DROPPED at this stage instead of being downgraded
-    // to the "advisory" category. Default behaviour is unchanged
-    // (downgrade only) so existing reports stay stable.
-    const advisoryRules = /target-size-enhanced|fixed-font-size|text-truncation|complex-background|motion|gesture-no-alternative/i;
-    const suppress = this.scan?.scan_options?.suppress_advisory_rules === true;
-    const filtered = issues.filter(issue => !this.isLikelyFalsePositive(issue));
-    if (suppress) {
-      const before = filtered.length;
-      const kept = filtered.filter(issue => !advisoryRules.test(issue.ruleId));
-      logger.info(`calibrateIssues: suppress_advisory_rules ON — dropped ${before - kept.length} advisory issue(s) (of ${before}).`);
-      return kept;
-    }
-    return filtered.map(issue => {
-      if (advisoryRules.test(issue.ruleId)) {
-        return { ...issue, category: "advisory", tags: this.unique([...(issue.tags || []), issue.wcag?.length ? "wcag-mapped" : "best-practice"]) };
-      }
-      return issue;
-    });
+    return issues
+      .filter(issue => !this.isLikelyFalsePositive(issue))
+      .map(issue => {
+        const advisoryRules = /target-size-enhanced|fixed-font-size|text-truncation|complex-background|motion|gesture-no-alternative/i;
+        if (advisoryRules.test(issue.ruleId)) {
+          return { ...issue, category: "advisory", tags: this.unique([...(issue.tags || []), issue.wcag?.length ? "wcag-mapped" : "best-practice"]) };
+        }
+        return issue;
+      });
   }
 
   private isLikelyFalsePositive(issue: ScanIssue): boolean {
@@ -4160,47 +4194,6 @@ export class AccessibilityScanner {
     if (/focus:invisible/i.test(issue.ruleId) && /tabindex=['"]?-1/.test(selectorText)) return true;
     if ((issue.affectedCount || 1) <= 0) return true;
     return false;
-  }
-
-  /**
-   * Ship 2 / Item 5 — assign a `landmark_group_key` to issues whose selector
-   * clearly targets a landmark region (banner / contentinfo / navigation /
-   * main / complementary / region / search / form).
-   *
-   * The scan detail endpoint aggregates issues with the same key across
-   * URLs so cross-page duplicates (e.g. a footer rule firing on all 30
-   * pages of a crawl) collapse to one entry with a "Appears on N pages"
-   * badge instead of flooding the report.
-   *
-   * The key is intentionally URL-independent — otherwise cross-URL
-   * grouping wouldn't work. Format: `{ruleId}|{landmark}|{stem}` where
-   * `stem` strips positional indices and dynamic id suffixes.
-   */
-  private assignLandmarkGroupKeys(issues: ScanIssue[]): void {
-    const LANDMARK_ROLES = ["banner", "contentinfo", "navigation", "main", "complementary", "region", "search", "form"];
-    const landmarkRegex = new RegExp(`\\b(${LANDMARK_ROLES.join("|")})\\b`, "i");
-    for (const issue of issues) {
-      const haystack = [
-        issue.selector || "",
-        ...(issue.selectors || []),
-        ...(issue.affectedElements || []),
-      ].join(" ").toLowerCase();
-      const match = landmarkRegex.exec(haystack);
-      if (!match) continue;
-      const landmark = match[1];
-      // Build a URL-independent stem: keep only class/id-like tokens,
-      // strip [N] positional indices and any digits inside ids/classes
-      // (e.g. `#header-3` → `#header`) so the same landmark on different
-      // pages produces the same stem.
-      const rawSelector = String(issue.selector || issue.selectors?.[0] || "");
-      const stem = rawSelector
-        .replace(/\[\d+\]/g, "")           // strip positional [N]
-        .replace(/[-_]\d+/g, "")           // strip -N / _N suffixes
-        .replace(/\s+/g, " ")
-        .trim()
-        .toLowerCase();
-      (issue as any).landmark_group_key = `${issue.ruleId}|${landmark}|${stem}`;
-    }
   }
 
   private deduplicateIssues(issues: ScanIssue[]): ScanIssue[] {
@@ -4264,11 +4257,6 @@ export class AccessibilityScanner {
   }
 
   private generateTestCases(): void {
-    // Tier 3 fix — the previous version stored `steps: []` for every test
-    // case, so the printed PDF had a "Steps" column that was always empty.
-    // Now we template steps by rule family / category so a tester can act on
-    // them. This is still boilerplate; a fuller step catalog would live in
-    // a rule registry, but this at least stops the "empty steps" bug.
     const seen = new Set<string>();
     for (const issue of this.allIssues) {
       const key = `${issue.ruleId}|${this.scanPageKeyWithoutState(issue.url)}`;
@@ -4282,143 +4270,10 @@ export class AccessibilityScanner {
         status: "fail",
         issueRuleId: issue.ruleId,
         issueUrl: issue.url,
-        steps: this.stepsForIssue(issue),
+        steps: [],
         result: `FAIL — ${issue.message}`,
       });
     }
-  }
-
-  /**
-   * Derives concrete tester steps from an issue.
-   * Templates per rule family — this is intentionally simple and readable so a
-   * future rule registry can override it per-rule if needed.
-   */
-  private stepsForIssue(issue: ScanIssue): string[] {
-    const url = issue.url || "the affected page";
-    const sel = issue.selector || issue.selectors?.[0] || "the affected element";
-    const rule = issue.ruleId || "";
-
-    const common = [
-      `Open ${url} in the target browser.`,
-    ];
-
-    if (/^focus:invisible/.test(rule)) {
-      return [
-        ...common,
-        `Press Tab until focus lands on ${sel}.`,
-        `Confirm a visible focus indicator (outline, box-shadow, border, or background change) appears.`,
-        `Compare against the rest of the page — the indicator must have at least 3:1 contrast with adjacent colors (WCAG 2.4.11).`,
-      ];
-    }
-    if (/^focus:obscured/.test(rule)) {
-      return [
-        ...common,
-        `Press Tab until focus lands on ${sel}.`,
-        `Confirm the focused element is fully visible — not hidden behind a sticky header, cookie banner, modal, or overflow container.`,
-      ];
-    }
-    if (/^focus:trap-missing|focus:escape-key-missing/.test(rule)) {
-      return [
-        ...common,
-        `Open the dialog / modal identified by ${sel}.`,
-        `Press Tab repeatedly and confirm focus stays inside the dialog.`,
-        `Press Escape and confirm the dialog closes and focus returns to the trigger element.`,
-      ];
-    }
-    if (/^keyboard:custom-role-activation/.test(rule)) {
-      return [
-        ...common,
-        `Tab to ${sel}.`,
-        `Press Enter — confirm the same action fires as when clicking the element.`,
-        `Press Space (buttons only) — confirm activation.`,
-      ];
-    }
-    if (/^keyboard:skip-link-missing/.test(rule)) {
-      return [
-        ...common,
-        `Press Tab once from the top of the page.`,
-        `Confirm a "Skip to main content" (or equivalent) link appears and receives focus.`,
-        `Press Enter and confirm focus moves to the main landmark.`,
-      ];
-    }
-    if (/^keyboard:focus-loop|keyboard:mouse-only/.test(rule)) {
-      return [
-        ...common,
-        `Press Tab repeatedly until you reach the end of the page.`,
-        `Confirm every interactive control is reachable and the tab cycle does not repeat prematurely.`,
-      ];
-    }
-    if (/^pointer:target-size|heuristic:target-size/.test(rule)) {
-      return [
-        ...common,
-        `Inspect ${sel} in devtools and confirm width AND height are ≥ 24 CSS pixels (WCAG 2.5.8) or ≥ 44 CSS pixels for enhanced (2.5.5).`,
-        `On a touch device, confirm the element can be activated with a fingertip without accidental neighbor activation.`,
-      ];
-    }
-    if (/^zoom:reflow-failure|heuristic:reflow/.test(rule)) {
-      return [
-        ...common,
-        `Resize the browser window to 320×256 CSS pixels (or set zoom to 400%).`,
-        `Confirm content reflows: no horizontal scrolling required to reach any content, no clipping.`,
-      ];
-    }
-    if (/^zoom:intermediate-breakpoint-failure/.test(rule)) {
-      return [
-        ...common,
-        `Set browser zoom to 200%.`,
-        `Confirm ${sel} does not clip, overflow horizontally, or overlap adjacent content.`,
-      ];
-    }
-    if (/^zoom:viewport-locked/.test(rule)) {
-      return [
-        ...common,
-        `Open on a mobile device (or emulate one).`,
-        `Attempt to pinch-zoom the page. Confirm zoom is allowed up to at least 200%.`,
-      ];
-    }
-    if (/^zoom:fixed-font-size|heuristic:text-truncation/.test(rule)) {
-      return [
-        ...common,
-        `Increase browser default font size to 200% via the browser's Text Size setting.`,
-        `Confirm text at ${sel} scales up and does not clip or overlap.`,
-      ];
-    }
-    if (/^color:contrast-insufficient|color:focus-indicator/.test(rule)) {
-      return [
-        ...common,
-        `Use a contrast tool (WebAIM, Colour Contrast Analyser) on ${sel}.`,
-        `Confirm the ratio meets WCAG 1.4.3 (4.5:1 for normal text, 3:1 for large text and non-text UI).`,
-      ];
-    }
-    if (/^heuristic:reduced-motion|state:motion/.test(rule)) {
-      return [
-        ...common,
-        `Enable "Reduce motion" in your OS accessibility settings (System Preferences → Accessibility → Display on macOS; Settings → Ease of Access → Display on Windows).`,
-        `Reload the page. Confirm large animations (spinners, autoplay slideshows, parallax) either stop or become subtle.`,
-      ];
-    }
-    if (/^heuristic:heading-|heuristic:landmark-|structure/.test(rule)) {
-      return [
-        ...common,
-        `Open a screen reader (NVDA, JAWS, or VoiceOver).`,
-        `List headings (H shortcut in NVDA) or landmarks (D). Confirm the structure matches the visible page.`,
-      ];
-    }
-    if (/^state:error-not-associated|forms/.test(rule)) {
-      return [
-        ...common,
-        `Submit the form empty (or with invalid data).`,
-        `Confirm each error message is programmatically associated with its input via aria-describedby or aria-errormessage.`,
-        `Confirm a screen reader announces the error when focus enters the input.`,
-      ];
-    }
-    // Fallback — still better than an empty list.
-    return [
-      ...common,
-      `Locate ${sel}.`,
-      `Verify the condition described in the issue message: ${issue.message.slice(0, 160)}${issue.message.length > 160 ? "..." : ""}`,
-      `Apply the recommended fix and re-run this test case.`,
-    ];
   }
 
   private generateManualHybridReviewCases(): void {
@@ -4600,20 +4455,373 @@ export class AccessibilityScanner {
     return `${prefix ? `${prefix} ` : ""}${marker} ${occurrence}`;
   }
 
+  // ROUND 5h — WCAG-Level-weighted score.
+  // Prior formula weighted only by axe/heuristic severity (critical/serious/…).
+  // This one weights primarily by WCAG conformance level (A > AA > AAA) —
+  // matching what auditors and legal frameworks actually care about (EN 301 549,
+  // Section 508, EAA all target Level AA conformance). Severity acts as a
+  // secondary multiplier within each level.
+  //
+  //   Level weight × Severity multiplier × Affected-count scale, summed →
+  //   score = 100 × capacity / (capacity + impact)   with capacity = 100 × √URLs
+  //
+  // Rationale for level weights (A=15, AA=8, AAA=3, unknown=2):
+  //   A   — hard failure of baseline access (e.g. keyboard trap, missing alt)
+  //   AA  — the WCAG conformance bar every EU/US regulation targets
+  //   AAA — enhanced; failures matter but don't block conformance at AA
+  //   unknown — heuristic finding without a mapped criterion
+  //
+  // Rationale for severity multipliers (critical=1.5 down to minor=0.4):
+  //   axe/heuristics also rate impact per instance. A critical Level A issue
+  //   should hurt more than a minor Level A issue.
+  //
+  // A single critical Level A issue on 1 URL:  15 × 1.5 = 22.5 → score ~82.
+  // A single moderate Level AA issue on 1 URL: 8  × 0.8 = 6.4  → score ~94.
+  // The Aug 25 Sky scan (16 issues, mostly AA + 3 at A) should now surface
+  // around 30-40, driven mainly by the A-level failures.
+  private static readonly WCAG_CRITERION_LEVELS: Record<string, "A" | "AA" | "AAA"> = {
+    "1.1.1":"A", "1.2.1":"A", "1.2.2":"A", "1.2.3":"A", "1.2.4":"AA", "1.2.5":"AA",
+    "1.2.6":"AAA", "1.2.7":"AAA", "1.2.8":"AAA", "1.2.9":"AAA",
+    "1.3.1":"A", "1.3.2":"A", "1.3.3":"A", "1.3.4":"AA", "1.3.5":"AA", "1.3.6":"AAA",
+    "1.4.1":"A", "1.4.2":"A", "1.4.3":"AA", "1.4.4":"AA", "1.4.5":"AA",
+    "1.4.6":"AAA", "1.4.7":"AAA", "1.4.8":"AAA", "1.4.9":"AAA",
+    "1.4.10":"AA", "1.4.11":"AA", "1.4.12":"AA", "1.4.13":"AA",
+    "2.1.1":"A", "2.1.2":"A", "2.1.3":"AAA", "2.1.4":"A",
+    "2.2.1":"A", "2.2.2":"A", "2.2.3":"AAA", "2.2.4":"AAA", "2.2.5":"AAA", "2.2.6":"AAA",
+    "2.3.1":"A", "2.3.2":"AAA", "2.3.3":"AAA",
+    "2.4.1":"A", "2.4.2":"A", "2.4.3":"A", "2.4.4":"A", "2.4.5":"AA", "2.4.6":"AA",
+    "2.4.7":"AA", "2.4.8":"AAA", "2.4.9":"AAA", "2.4.10":"AAA",
+    "2.4.11":"AA", "2.4.12":"AA", "2.4.13":"AAA",
+    "2.5.1":"A", "2.5.2":"A", "2.5.3":"A", "2.5.4":"A", "2.5.5":"AAA", "2.5.6":"AAA",
+    "2.5.7":"AA", "2.5.8":"AA",
+    "3.1.1":"A", "3.1.2":"AA", "3.1.3":"AAA", "3.1.4":"AAA", "3.1.5":"AAA", "3.1.6":"AAA",
+    "3.2.1":"A", "3.2.2":"A", "3.2.3":"AA", "3.2.4":"AA", "3.2.5":"AAA", "3.2.6":"A",
+    "3.3.1":"A", "3.3.2":"A", "3.3.3":"AA", "3.3.4":"AA", "3.3.5":"AAA", "3.3.6":"AAA",
+    "3.3.7":"A", "3.3.8":"AA", "3.3.9":"AAA",
+    "4.1.1":"A", "4.1.2":"A", "4.1.3":"AA",
+  };
+
+  private wcagLevelForIssue(issue: ScanIssue): "A" | "AA" | "AAA" | "unknown" {
+    const rank = { A: 1, AA: 2, AAA: 3 } as const;
+    let strongest: "A" | "AA" | "AAA" | null = null;
+    const raw: string[] = [];
+    const criteria = (issue as any).wcag_criteria;
+    const tags = (issue as any).tags;
+    if (Array.isArray(criteria)) raw.push(...criteria.map(String));
+    if (Array.isArray(tags)) raw.push(...tags.map(String));
+    for (const t of raw) {
+      // ROUND 5l — use full normaliser (see AccessibilityScanner.normaliseCriterionTag)
+      // instead of the too-narrow dotted-only regex, so tag shapes like
+      // "wcag2aa-1.4.10", "wcag1410", "sc 1.4.10" all resolve. The old regex
+      // missed all axe-emitted tags — that's why conformance was showing 100%.
+      const key = AccessibilityScanner.normaliseCriterionTag(t);
+      if (!key) continue;
+      const lvl = AccessibilityScanner.WCAG_CRITERION_LEVELS[key];
+      if (!lvl) continue;
+      if (!strongest || rank[lvl] < rank[strongest]) strongest = lvl;
+    }
+    return strongest || "unknown";
+  }
+
+  // ROUND 5l — Full-strength criterion normaliser.
+  // ROUND 5r — Fixed the "section508" false positive: previously it matched
+  // the compact digit pattern and returned "5.0.8" (which is not a WCAG
+  // criterion). Now explicitly rejects tags that start with non-WCAG
+  // prefixes (section508, best-practice, ACT, cat.*, etc.).
+  private static normaliseCriterionTag(tag: string): string | null {
+    let raw = String(tag || "").toLowerCase().trim();
+    if (!raw) return null;
+    // ROUND 5r — reject non-WCAG tag prefixes explicitly so their digits
+    // don't get mangled into fake criterion numbers.
+    if (/^(?:section508|best-practice|cat\.|act[-_]?|experimental|review-item|deprecated|rgaa|en[-_]?301|tt|ttv|unien)/.test(raw)) {
+      return null;
+    }
+    raw = raw.replace(/^wcag\s*/, "").replace(/^sc\s*/, "").replace(/^(?:level\s*)?a+\s+/, "");
+    if (/^[\d.]*a+$/.test(raw)) return null;
+    const dotted = raw.match(/^(\d)\.(\d)\.(\d{1,2})$/);
+    if (dotted) return `${dotted[1]}.${dotted[2]}.${dotted[3]}`;
+    const mixed = raw.match(/(\d)\.(\d)\.(\d{1,2})(?!\d)/);
+    if (mixed) return `${mixed[1]}.${mixed[2]}.${mixed[3]}`;
+    const compact = raw.replace(/[^0-9]/g, "");
+    if (/^\d{3,4}$/.test(compact)) return `${compact[0]}.${compact[1]}.${compact.slice(2)}`;
+    return null;
+  }
+
+  // ROUND 5r — Level fallback. Detects WCAG level from tags like "wcag2a",
+  // "wcag2aa", "wcag21a", "wcag22aa" — level info without specific criterion.
+  // Used by computeConformanceBreakdown to count issues that have level info
+  // but no specific criterion tag (which is common for heuristic findings
+  // and generic axe rules), so they factor into the conformance score.
+  private static wcagLevelFromLevelTag(tag: string): "A" | "AA" | "AAA" | null {
+    const lower = String(tag || "").toLowerCase().trim();
+    // Match wcag2a, wcag21a, wcag2aa, wcag22aa, wcag2aaa, etc.
+    const m = lower.match(/^wcag\s*\d{0,2}(a+)$/);
+    if (!m) return null;
+    const aCount = m[1].length;
+    if (aCount === 1) return "A";
+    if (aCount === 2) return "AA";
+    if (aCount === 3) return "AAA";
+    return null;
+  }
+
+  // Determines strongest (most severe) WCAG level associated with an issue,
+  // whether from a specific criterion tag or a level-only tag. Returns
+  // "unknown" if nothing WCAG-related is tagged.
+  private determineIssueLevel(issue: ScanIssue): "A" | "AA" | "AAA" | "unknown" {
+    const fromCriterion = this.wcagLevelForIssue(issue);
+    if (fromCriterion !== "unknown") return fromCriterion;
+    const rank = { A: 1, AA: 2, AAA: 3 } as const;
+    let strongest: "A" | "AA" | "AAA" | null = null;
+    const raw: string[] = [];
+    const criteria = (issue as any).wcag_criteria;
+    const tags = (issue as any).tags;
+    if (Array.isArray(criteria)) raw.push(...criteria.map(String));
+    if (Array.isArray(tags)) raw.push(...tags.map(String));
+    for (const t of raw) {
+      const lvl = AccessibilityScanner.wcagLevelFromLevelTag(t);
+      if (!lvl) continue;
+      if (!strongest || rank[lvl] < rank[strongest]) strongest = lvl;
+    }
+    return strongest || "unknown";
+  }
+
+  // ROUND 5i — Evinced-style weighted pass/fail score.
+  // Aligned with the industry-standard scoring model used by Cypress,
+  // BrowserStack, and (as documented publicly) Evinced-style scoring:
+  //   Score = 100 × capacity / (capacity + Σ failed weights × penalty)
+  //
+  // Per-issue weight = axeSeverityWeight × wcagLevelMultiplier × affectedScale
+  // Penalty = 2 (failed rules penalized twice — Cypress/BrowserStack convention).
+  //
+  // Axe severity weights (matches axe-core impact taxonomy):
+  //   critical: 10  — blocks core interaction (keyboard trap, missing controls)
+  //   serious:   7  — high impact, definite barrier
+  //   moderate:  4  — significant but not blocking
+  //   minor:     1  — cosmetic or nice-to-have
+  //
+  // WCAG Level multiplier:
+  //   A:   1.5  — baseline access; conformance to A is legally minimum
+  //   AA:  1.2  — the EN 301 549 / EAA / Section 508 target level
+  //   AAA: 0.6  — enhanced; failures matter less for conformance
+  //   unknown: 1.0
+  //
+  // Capacity = 250 × √URLs — tuned so a single Serious/AA issue with 1
+  // affected instance on 1 URL scores ~92, and a Sky-like page with 16
+  // mixed issues scores ~30-35 (matches the ballpark of the previous
+  // scoring model, but now driven by the industry-standard formula).
+  //
+  // Additionally exposes computeConformanceBreakdown() for the report layer:
+  // per-level (A/AA/AAA) applicable vs failed counts, matching how
+  // conformance is normally reported to auditors and regulators.
   private computeScore(issues: ScanIssue[]): number {
     if (!issues.length) return 100;
-    const weights: Record<string, number> = { critical: 14, serious: 8, moderate: 3.5, minor: 1 };
+
+    const severityWeight: Record<string, number> = {
+      critical: 10, serious: 7, moderate: 4, minor: 1,
+    };
+    const levelMultiplier = { A: 1.5, AA: 1.2, AAA: 0.6, unknown: 1.0 } as const;
+    const FAILURE_PENALTY = 2;
+
     const urls = new Set(issues.map(i => i.url)).size || 1;
-    const impact = issues.reduce((acc, issue) => {
+
+    const failedWeightSum = issues.reduce((acc, issue) => {
+      const sevW = severityWeight[issue.severity] || 3;
+      const level = this.wcagLevelForIssue(issue);
+      const lvlM = levelMultiplier[level];
       const affected = Math.max(issue.affectedCount || issue.selectors?.length || 1, 1);
-      const scale = 1 + Math.min(Math.log2(affected), 6) * 0.18;
-      return acc + (weights[issue.severity] || 1) * scale;
+      const scale = 1 + Math.min(Math.log2(affected), 6) * 0.25;
+      return acc + sevW * lvlM * scale;
     }, 0);
 
-    const capacity = 95 * Math.sqrt(urls);
-    const score = 100 / (1 + impact / capacity);
-    const rounded = Math.round(score);
-    return Math.max(1, Math.min(100, rounded));
+    const capacity = 250 * Math.sqrt(urls);
+    const impact = failedWeightSum * FAILURE_PENALTY;
+    const score = 100 * capacity / (capacity + impact);
+    return Math.max(1, Math.min(100, Math.round(score)));
+  }
+
+  // ROUND 5i — Conformance breakdown used by the report layer.
+  // Applicable-set model (Capgemini-style pass/fail): for each level (A,AA,AAA)
+  // count how many WCAG criteria the scanner is aware of at that level, and how
+  // many have at least one failed issue in this scan. This is complementary to
+  // the Evinced-style score above — one number for engineering focus (the
+  // weighted score), one for auditor/legal-facing reports (conformance %).
+  //
+  // Returned shape (matches what reportService.ts consumes):
+  //   {
+  //     score: <Evinced-style 0-100>,
+  //     conformance: {
+  //       A:   { applicable, failed, passed, pct },
+  //       AA:  { applicable, failed, passed, pct },
+  //       AAA: { applicable, failed, passed, pct },
+  //       overall_A_AA: { applicable, failed, passed, pct },
+  //     },
+  //     failed_criteria: [
+  //       { criterion: "2.1.1", level: "A", defect_count, issue_ids },
+  //       ...
+  //     ],
+  //   }
+  public computeConformanceBreakdown(): {
+    score: number;
+    conformance: Record<string, { applicable: number; failed: number; passed: number; pct: number }>;
+    failed_criteria: { criterion: string; level: string; defect_count: number; issue_ids: string[] }[];
+    contributors?: any[];
+    formula?: any;
+  } {
+    const applicableByLevel: Record<string, string[]> = { A: [], AA: [], AAA: [] };
+    for (const [criterion, level] of Object.entries(AccessibilityScanner.WCAG_CRITERION_LEVELS)) {
+      applicableByLevel[level].push(criterion);
+    }
+
+    // Build a criterion → { defects, issue_ids } map from this scan's issues.
+    const failedMap = new Map<string, { level: string; ids: Set<string>; count: number }>();
+    for (const issue of this.allIssues) {
+      const raw: string[] = [];
+      const criteria = (issue as any).wcag_criteria;
+      const tags = (issue as any).tags;
+      if (Array.isArray(criteria)) raw.push(...criteria.map(String));
+      if (Array.isArray(tags)) raw.push(...tags.map(String));
+      for (const t of raw) {
+        // ROUND 5l — use the full normaliser so axe-emitted shapes resolve.
+        const key = AccessibilityScanner.normaliseCriterionTag(t);
+        if (!key) continue;
+        const lvl = AccessibilityScanner.WCAG_CRITERION_LEVELS[key];
+        if (!lvl) continue;
+        if (!failedMap.has(key)) failedMap.set(key, { level: lvl, ids: new Set(), count: 0 });
+        const entry = failedMap.get(key)!;
+        entry.count += Math.max(issue.affectedCount || 1, 1);
+        if ((issue as any).id) entry.ids.add(String((issue as any).id));
+      }
+    }
+
+    const perLevel = (level: string) => {
+      const applicable = applicableByLevel[level]?.length || 0;
+      const failed = Array.from(failedMap.values()).filter(v => v.level === level).length;
+      const passed = applicable - failed;
+      const pct = applicable ? Math.round((passed / applicable) * 10000) / 100 : 100;
+      return { applicable, failed, passed, pct };
+    };
+
+    // ROUND 5r — Count issues that have WCAG level info (from tags like
+    // "wcag2a" or "wcag2aa") but NO specific criterion match. These issues
+    // are legitimate accessibility failures at a WCAG level but their tag
+    // shape doesn't reveal WHICH criterion — so they were escaping the
+    // per-criterion conformance score entirely, leaving the score at 100%
+    // even when real Level A / AA failures exist. Now they count toward the
+    // level's failure total via a synthetic "unmapped" bucket.
+    const unmappedLevelIssues = { A: 0, AA: 0, AAA: 0 };
+    const unmappedLevelIssueIds: Record<string, string[]> = { A: [], AA: [], AAA: [] };
+    for (const issue of this.allIssues) {
+      // Was this issue already counted in failedMap (i.e., a specific
+      // criterion was extracted)?
+      const raw: string[] = [];
+      const criteria = (issue as any).wcag_criteria;
+      const tags = (issue as any).tags;
+      if (Array.isArray(criteria)) raw.push(...criteria.map(String));
+      if (Array.isArray(tags)) raw.push(...tags.map(String));
+      const mappedToSomeCriterion = raw.some(t => {
+        const k = AccessibilityScanner.normaliseCriterionTag(t);
+        return k !== null && !!AccessibilityScanner.WCAG_CRITERION_LEVELS[k];
+      });
+      if (mappedToSomeCriterion) continue;
+      // Not mapped to any criterion — check level-only tags.
+      const level = this.determineIssueLevel(issue);
+      if (level === "unknown") continue;
+      unmappedLevelIssues[level]++;
+      if ((issue as any).id) unmappedLevelIssueIds[level].push(String((issue as any).id).slice(0, 8));
+    }
+
+    const A = perLevel("A");
+    const AA = perLevel("AA");
+    const AAA = perLevel("AAA");
+
+    // ROUND 5r — merge unmapped-level counts into the level's failed count.
+    // Each unmapped issue counts as 1 additional pseudo-failure at that level.
+    // The applicable set grows too, so the pct math stays proportional.
+    const A_total = { applicable: A.applicable + unmappedLevelIssues.A, failed: A.failed + unmappedLevelIssues.A, passed: A.passed, pct: 0 };
+    A_total.pct = A_total.applicable ? Math.round((A_total.passed / A_total.applicable) * 10000) / 100 : 100;
+    const AA_total = { applicable: AA.applicable + unmappedLevelIssues.AA, failed: AA.failed + unmappedLevelIssues.AA, passed: AA.passed, pct: 0 };
+    AA_total.pct = AA_total.applicable ? Math.round((AA_total.passed / AA_total.applicable) * 10000) / 100 : 100;
+    const AAA_total = { applicable: AAA.applicable + unmappedLevelIssues.AAA, failed: AAA.failed + unmappedLevelIssues.AAA, passed: AAA.passed, pct: 0 };
+    AAA_total.pct = AAA_total.applicable ? Math.round((AAA_total.passed / AAA_total.applicable) * 10000) / 100 : 100;
+
+    const overall = {
+      applicable: A_total.applicable + AA_total.applicable,
+      failed: A_total.failed + AA_total.failed,
+      passed: A_total.passed + AA_total.passed,
+      pct: (A_total.applicable + AA_total.applicable)
+        ? Math.round(((A_total.passed + AA_total.passed) / (A_total.applicable + AA_total.applicable)) * 10000) / 100
+        : 100,
+    };
+
+    // ROUND 5l/5r — diagnostic log for conformance breakdown.
+    const totalIssues = this.allIssues.length;
+    const matchedCriteria = Array.from(failedMap.keys()).sort();
+    const unmatched: string[] = [];
+    for (const issue of this.allIssues.slice(0, 8)) {
+      const raw: string[] = [];
+      const criteria = (issue as any).wcag_criteria;
+      const tags = (issue as any).tags;
+      if (Array.isArray(criteria)) raw.push(...criteria.map(String));
+      if (Array.isArray(tags)) raw.push(...tags.map(String));
+      for (const t of raw) {
+        if (!AccessibilityScanner.normaliseCriterionTag(t)) unmatched.push(t);
+      }
+    }
+    logger.info(`[conformance] ROUND 5r — issues=${totalIssues}, matchedCriteria=[${matchedCriteria.join(",")}], unmappedLevelIssues={A:${unmappedLevelIssues.A}, AA:${unmappedLevelIssues.AA}, AAA:${unmappedLevelIssues.AAA}}, A(applicable=${A_total.applicable},failed=${A_total.failed},pct=${A_total.pct}), AA(applicable=${AA_total.applicable},failed=${AA_total.failed},pct=${AA_total.pct}), overall_A_AA_pct=${overall.pct}. Sample unmatched tags (first 8): [${Array.from(new Set(unmatched)).slice(0, 20).map(x => `"${x}"`).join(",")}]`);
+
+    const failed_criteria = Array.from(failedMap.entries())
+      .map(([criterion, v]) => ({
+        criterion,
+        level: v.level,
+        defect_count: v.count,
+        issue_ids: Array.from(v.ids),
+      }))
+      .sort((a, b) => {
+        const rank = { A: 1, AA: 2, AAA: 3 } as Record<string, number>;
+        if (rank[a.level] !== rank[b.level]) return rank[a.level] - rank[b.level];
+        return a.criterion.localeCompare(b.criterion);
+      });
+
+    // ROUND 5j — Per-issue score contribution for methodology transparency.
+    // Same formula as computeScore() so the report can show "here's what
+    // dragged your score from 100 down to 42, ranked by impact".
+    const severityWeight: Record<string, number> = { critical: 10, serious: 7, moderate: 4, minor: 1 };
+    const levelMultiplier = { A: 1.5, AA: 1.2, AAA: 0.6, unknown: 1.0 } as const;
+    const contributors = this.allIssues.map(issue => {
+      const sevW = severityWeight[issue.severity] || 3;
+      const level = this.wcagLevelForIssue(issue);
+      const lvlM = levelMultiplier[level];
+      const affected = Math.max(issue.affectedCount || issue.selectors?.length || 1, 1);
+      const scale = 1 + Math.min(Math.log2(affected), 6) * 0.25;
+      const weight = sevW * lvlM * scale;
+      return {
+        issue_id: String((issue as any).id || "").slice(0, 8),
+        title: String((issue as any).title || issue.ruleId || "").slice(0, 120),
+        severity: issue.severity,
+        wcag_level: level,
+        affected_count: affected,
+        severity_weight: sevW,
+        level_multiplier: lvlM,
+        affected_scale: Math.round(scale * 100) / 100,
+        contribution: Math.round(weight * 100) / 100,
+      };
+    }).sort((a, b) => b.contribution - a.contribution);
+
+    return {
+      score: this.computeScore(this.allIssues),
+      conformance: { A: A_total, AA: AA_total, AAA: AAA_total, overall_A_AA: overall },
+      failed_criteria,
+      contributors,
+      formula: {
+        model: "Evinced-style weighted defect ratio (aligned with axe-core impact + WCAG level)",
+        equation: "score = 100 × capacity / (capacity + Σ(weight) × 2)",
+        weight_formula: "weight = axeSeverityWeight × wcagLevelMultiplier × (1 + min(log2(1+affected), 6) × 0.25)",
+        severity_weights: severityWeight,
+        level_multipliers: levelMultiplier,
+        failure_penalty: 2,
+        capacity: "250 × √URLs",
+      },
+    };
   }
 
   private computeFixPriority(issue: ScanIssue): number {

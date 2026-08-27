@@ -374,13 +374,21 @@ async function driveToOtpScreen(session: LiveSession, input: StartSessionInput):
     }
   });
 
+  // ROUND 5g — Prefer navigating to authConfig.home_url over the target URL.
+  // Sky reliably redirects unauthenticated users hitting /home to /login,
+  // whereas target URLs sometimes get served directly if Sky considers the
+  // session already authenticated — causing "Could not find a login form".
+  // If home_url is not provided, fall back to the target URL (legacy behaviour).
+  const homeUrl = String(input.authConfig?.home_url || "").trim();
+  const navUrl  = homeUrl || input.targetUrl;
+
   session.phase = "filling_credentials";
-  step(`navigating to ${input.targetUrl}`);
+  step(`navigating to ${navUrl} (home_url=${homeUrl ? "yes" : "no"})`);
   try {
-    await page.goto(input.targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.goto(navUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
   } catch (err: any) {
     await saveDiagnosticSnapshot(page, sid, "nav-failed").catch(() => undefined);
-    throw new Error(`Navigation to ${input.targetUrl} failed: ${err?.message || err}`);
+    throw new Error(`Navigation to ${navUrl} failed: ${err?.message || err}`);
   }
   step(`nav complete, current URL=${page.url()}`);
 
@@ -392,6 +400,21 @@ async function driveToOtpScreen(session: LiveSession, input: StartSessionInput):
   await dismissCookieConsent(page);
   await page.waitForTimeout(1000);
   step(`cookie phase done, URL=${page.url()}`);
+
+  // ROUND 5g — Already-authenticated detection.
+  // If we navigated to home_url and Sky did NOT redirect us to /login,
+  // we're already authenticated (leftover cookies from a prior session,
+  // or the user's own browser session). Skip login form + OTP entirely
+  // and hand cookies straight to the scanner.
+  if (homeUrl) {
+    const currentUrl = page.url();
+    const onLoginPage = /\/login\b|\/security\b|\/signin\b|\/sign-in\b|\/auth\b/i.test(currentUrl);
+    if (!onLoginPage) {
+      logger.info(`[auth-session ${sid}] ROUND 5g — Already authenticated (landed on ${currentUrl} without login redirect). Skipping login form + OTP steps.`);
+      await finalizeAlreadyAuthenticatedSession(session, input, sid, t0);
+      return;
+    }
+  }
 
   step("auto-detecting login form");
   const form = await findLoginForm(page).catch(() => null);
@@ -465,6 +488,87 @@ async function driveToOtpScreen(session: LiveSession, input: StartSessionInput):
   };
   session.phase = "awaiting_otp";
   logger.info(`[auth-session ${sid}] READY (t+${Date.now() - t0}ms) — waiting for user to enter OTP`);
+}
+
+// -----------------------------------------------------------------------------
+// ROUND 5g — Already-authenticated fast-path
+// -----------------------------------------------------------------------------
+/**
+ * Called from driveToOtpScreen when we detect that we're already logged in
+ * (navigated to home_url and Sky did NOT bounce us to /login). Skips the
+ * login form + OTP entirely and hands the current cookies to the scanner.
+ *
+ * Mirrors the DB-persist + queue block from submitOtp() — kept as a separate
+ * copy on purpose so the OTP-success path is untouched and low-risk.
+ */
+async function finalizeAlreadyAuthenticatedSession(
+  session: LiveSession,
+  input: StartSessionInput,
+  sid: string,
+  t0: number
+): Promise<void> {
+  if (!session.context) {
+    throw new Error("finalizeAlreadyAuthenticatedSession: no browser context available");
+  }
+
+  // Build scan URL list (same as normal path).
+  const scanUrls = extractScanUrls(input);
+  logger.info(`[auth-session ${sid}] Scan URL list built: ${JSON.stringify(scanUrls)}`);
+
+  // Assemble pendingScan the same way the OTP path would have.
+  session.pendingScan = {
+    scanName: input.scanName,
+    scanOptions: input.scanOptions || {},
+    authConfig: input.authConfig || {},
+    projectId: input.projectId,
+    createdBy: input.createdBy,
+    urls: scanUrls,
+    stateLabel: "prod-auth-cookie-reuse",  // distinct label for observability
+  };
+
+  // Extract cookies from the live browser context.
+  const cookies = await session.context.cookies();
+  logger.info(`[auth-session ${sid}] ROUND 5g cookie-reuse: ${cookies.length} cookies extracted (t+${Date.now() - t0}ms)`);
+
+  const scanOptions = {
+    ...(session.pendingScan.scanOptions || {}),
+    extension_session_cookies: cookies.map(c => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+      expires: c.expires,
+      httpOnly: c.httpOnly,
+      secure: c.secure,
+      sameSite: c.sameSite,
+    })),
+  };
+
+  const authConfigJson = JSON.stringify(session.pendingScan.authConfig || {});
+  logger.info(`[auth-session ${sid}] Persisting auth_config with ${authConfigJson.length} chars (cookie-reuse path)`);
+
+  const scanInsert = await db.query(
+    `INSERT INTO scans (name, urls, project_id, created_by, state_label, auth_config, scan_options, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'queued') RETURNING *`,
+    [
+      session.pendingScan.scanName || `Prod scan ${new Date().toLocaleString()}`,
+      session.pendingScan.urls,
+      session.pendingScan.projectId || null,
+      session.pendingScan.createdBy,
+      session.pendingScan.stateLabel,
+      authConfigJson,
+      JSON.stringify(scanOptions),
+    ]
+  );
+  const scan = scanInsert.rows[0];
+  session.scanId = scan.id;
+  session.phase = "authenticated";
+
+  await scanQueue.add(scan.id);
+  logger.info(`[auth-session ${sid}] Scan ${scan.id} queued via cookie-reuse path (skipped OTP), urls=${JSON.stringify(session.pendingScan.urls)}, journey_targets=${(session.pendingScan.scanOptions?.target_interactions || session.pendingScan.authConfig?.targets || []).length}`);
+
+  await cleanupBrowser(session);
+  setTimeout(() => sessions.delete(session.id), 60 * 1000);
 }
 
 // -----------------------------------------------------------------------------

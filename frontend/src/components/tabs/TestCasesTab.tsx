@@ -2,16 +2,32 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { scanApi } from "../../services/api";
 import { motion } from "framer-motion";
 import {
-  CheckCircle2, XCircle, Clock, Loader2, SlidersHorizontal,
+  CheckCircle2, XCircle, Clock, Loader2, SlidersHorizontal, ListChecks, AlertCircle,
 } from "lucide-react";
 import { AccordionChevron } from "../ui/AccordionChevron";
 import { useEffect, useRef, useState } from "react";
 
+// Raw statuses stored in DB: 'pass', 'fail', 'pending'.
+// STATUS_CONFIG is used by the filter panel and per-case badges
+// (fine-grained view of the raw values).
 const STATUS_CONFIG: Record<string, { icon: any; color: string; bg: string; label: string }> = {
   pass:    { icon: CheckCircle2, color: "#22c55e", bg: "rgba(34,197,94,0.1)",   label: "Pass" },
   fail:    { icon: XCircle,      color: "#ff4d6d", bg: "rgba(255,77,109,0.1)",  label: "Fail" },
-  pending: { icon: Clock,        color: "#94a3b8", bg: "rgba(148,163,184,0.1)", label: "In Progress" },
+  pending: { icon: Clock,        color: "#f59e0b", bg: "rgba(245,158,11,0.1)",  label: "Needs Review" },
 };
+
+// BUCKET_CONFIG drives the 4-card summary row.
+// Buckets roll up the raw status × category into meaningful groups:
+//   - Passed     = auto pass + reviewed-pass (any category with status='pass')
+//   - Failed     = auto fail + reviewed-fail (any category with status='fail')
+//   - Needs Rev  = all pending (manual + hybrid awaiting human verification)
+//   - Total      = sum of all
+const BUCKET_CONFIG: Array<{ key: string; label: string; icon: any; color: string; bg: string; borderRgba: string }> = [
+  { key: "passed",  label: "Passed",       icon: CheckCircle2, color: "#22c55e", bg: "rgba(34,197,94,0.10)",  borderRgba: "rgba(34,197,94,0.30)" },
+  { key: "failed",  label: "Failed",       icon: XCircle,      color: "#ff4d6d", bg: "rgba(255,77,109,0.10)", borderRgba: "rgba(255,77,109,0.30)" },
+  { key: "review",  label: "Needs Review", icon: AlertCircle,  color: "#f59e0b", bg: "rgba(245,158,11,0.10)", borderRgba: "rgba(245,158,11,0.30)" },
+  { key: "total",   label: "Total",        icon: ListChecks,   color: "#94a3b8", bg: "rgba(148,163,184,0.10)", borderRgba: "rgba(148,163,184,0.30)" },
+];
 
 function StatusBadge({ status }: { status: string }) {
   const c = STATUS_CONFIG[status] || STATUS_CONFIG.pending;
@@ -316,29 +332,49 @@ export default function TestCasesTab({ scanId }: { scanId: string }) {
   const hybridCases = sortTestCases(visibleTestCases.filter(tc => isHybridCase(tc)));
   const automatedCases = sortTestCases(visibleTestCases.filter(tc => !isManualCase(tc) && !isHybridCase(tc)));
 
+  // Raw status counts (used by filter panel — pass/fail/pending)
   const counts = testCases.reduce((acc: any, tc: any) => {
     acc[tc.status] = (acc[tc.status] || 0) + 1;
     return acc;
   }, {});
 
-  const passRate = testCases.length > 0
-    ? Math.round(((counts.pass || 0) / testCases.length) * 100)
+  // 4-bucket rollup for the summary card row
+  // (Passed = any status='pass' regardless of category, same for Failed.
+  //  Needs Review = all pending, regardless of manual/hybrid category.)
+  const bucketCounts = {
+    passed: counts.pass || 0,
+    failed: counts.fail || 0,
+    review: counts.pending || 0,
+    total:  testCases.length,
+  };
+
+  // Pass rate — honest denominator: only count things that could be pass or fail.
+  // Pending items are shown separately as "Needs Review" and don't drag the rate down.
+  const decidedCount = bucketCounts.passed + bucketCounts.failed;
+  const passRate = decidedCount > 0
+    ? Math.round((bucketCounts.passed / decidedCount) * 100)
     : 0;
+
   const toggleStatusFilter = (status: string) => {
     setStatusFilter(current => current.includes(status) ? current.filter(item => item !== status) : [...current, status]);
   };
 
   return (
     <div className="p-6">
-      <div className="grid grid-cols-3 gap-3 mb-6">
-        {Object.entries(STATUS_CONFIG).map(([key, cfg]) => {
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+        {BUCKET_CONFIG.map(cfg => {
           const Icon = cfg.icon;
+          const value = bucketCounts[cfg.key as keyof typeof bucketCounts];
           return (
-            <div key={key} className="card px-4 py-3 flex items-center gap-3">
-              <Icon size={16} style={{ color: cfg.color }} />
+            <div
+              key={cfg.key}
+              className="card px-4 py-3 flex items-center gap-3"
+              style={{ borderColor: cfg.borderRgba, background: cfg.bg }}
+            >
+              <Icon size={18} style={{ color: cfg.color }} />
               <div>
-                <div className="text-lg font-bold text-slate-200">{counts[key] || 0}</div>
-                <div className="text-xs text-slate-600">{cfg.label}</div>
+                <div className="text-lg font-bold" style={{ color: cfg.color }}>{value}</div>
+                <div className="text-xs" style={{ color: "var(--muted)" }}>{cfg.label}</div>
               </div>
             </div>
           );
@@ -423,7 +459,10 @@ export default function TestCasesTab({ scanId }: { scanId: string }) {
               transition={{ duration: 1, ease: "easeOut" }}
               style={{ background: passRate >= 80 ? "#22c55e" : passRate >= 50 ? "#ffd60a" : "#ff4d6d" }} />
           </div>
-          <p className="text-xs text-slate-600 mt-1">{counts.pass || 0} of {testCases.length} tests passing</p>
+          <p className="text-xs text-slate-600 mt-1">
+            {bucketCounts.passed} of {decidedCount} decided tests passing
+            {bucketCounts.review > 0 && <> · <span style={{ color: "#f59e0b" }}>{bucketCounts.review} awaiting review</span></>}
+          </p>
         </div>
       )}
 

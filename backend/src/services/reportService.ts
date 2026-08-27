@@ -141,33 +141,37 @@ function severityRank(severity: string): number {
   return { critical: 1, serious: 2, moderate: 3, minor: 4 }[severity] || 5;
 }
 
+// FIX (Ship 1 / Item 2 follow-up) — Previously used fragile string-regex over
+// joined tags. That worked when the raw tag string already contained "(A)" /
+// "(AA)" from axe-core output, but heuristic-emitted issues (zoom, pointer,
+// focus, contrast) store just the criterion number ("1.4.10", "2.4.7") with
+// no parenthesised level, so every heuristic issue fell through to
+// "Needs review" — producing the "0% Level A / 0% Level AA / 100% Needs
+// review" pie in the Executive Report even though per-issue rows correctly
+// showed "WCAG 1.4.10 (AA)".
+//
+// New approach: resolve each criterion via the same wcagCriterionLevels
+// lookup table wcagText() already uses (line ~153). Take the strongest
+// (lowest) level found — A > AA > AAA — because a Level A violation blocks
+// A conformance regardless of any AA violations attached to the same issue.
 function wcagLevel(issue: any): "A" | "AA" | "AAA" | "Advisory" | "Needs review" {
-  // Ship 1 / Item 2 fix — the previous implementation regex-matched axe-core
-  // level tags (wcag2a / wcag22aa / wcag22aaa) on the joined string. Since the
-  // scanner + governance now emit criterion codes (2.4.11 / wcag2.4.11 / the
-  // compact "2411" form), every issue fell through to "Needs review" in the
-  // PDF while the dashboard bucketed them correctly. Fix: normalize each tag
-  // to a dotted criterion, look up its level in wcagCriterionLevels, and take
-  // the strictest present. Falls back to legacy axe level tags, then to a
-  // "best-practice" tag / "advisory" category check — mirroring the frontend
-  // logic in frontend/src/utils/wcag.ts so PDF and dashboard agree.
-  const rawTags = asArray(issue.wcag_criteria).concat(asArray(issue.tags)).map(String);
-  const found = new Set<"A" | "AA" | "AAA">();
-  for (const raw of rawTags) {
-    const criterion = wcagCriterionFromTag(raw);
-    if (criterion && wcagCriterionLevels[criterion]) {
-      found.add(wcagCriterionLevels[criterion]);
-      continue;
-    }
-    const lower = raw.toLowerCase().trim();
-    if (/^wcag\d*aaa$/.test(lower)) found.add("AAA");
-    else if (/^wcag\d*aa$/.test(lower)) found.add("AA");
-    else if (/^wcag\d*a$/.test(lower)) found.add("A");
+  const rank = { A: 1, AA: 2, AAA: 3 } as const;
+  let strongest: "A" | "AA" | "AAA" | null = null;
+  const items = asArray(issue.wcag_criteria).concat(asArray(issue.tags));
+  for (const raw of items) {
+    const criterion = wcagCriterionFromTag(String(raw));
+    if (!criterion) continue;
+    const level = wcagCriterionLevels[criterion];
+    if (!level) continue;
+    if (!strongest || rank[level] < rank[strongest]) strongest = level;
   }
-  if (found.has("A")) return "A";
-  if (found.has("AA")) return "AA";
-  if (found.has("AAA")) return "AAA";
-  if (rawTags.some(tag => tag.toLowerCase() === "best-practice")) return "Advisory";
+  if (strongest) return strongest;
+  // Fallback to the legacy regex for issues whose tag strings already carry
+  // an explicit "(A)/(AA)/(AAA)" or "level a/aa/aaa" marker (axe-core shape).
+  const tags = items.map(String).join(" ").toLowerCase();
+  if (/wcag\d*aaa|\baaa\b|level aaa/.test(tags)) return "AAA";
+  if (/wcag\d*aa|\baa\b|level aa/.test(tags)) return "AA";
+  if (/\blevel a\b|\(a\)/.test(tags)) return "A";
   if (String(issue.category || "").toLowerCase() === "advisory") return "Advisory";
   return "Needs review";
 }
@@ -177,13 +181,7 @@ const wcagCriterionLevels: Record<string, "A" | "AA" | "AAA"> = {
   "2.1.1": "A", "2.1.2": "A", "2.2.1": "A", "2.2.2": "A", "2.3.1": "A", "2.4.1": "A", "2.4.2": "A", "2.4.3": "A", "2.4.4": "A",
   "3.1.1": "A", "3.2.1": "A", "3.2.2": "A", "3.3.1": "A", "3.3.2": "A", "4.1.1": "A", "4.1.2": "A",
   "1.2.4": "AA", "1.2.5": "AA", "1.3.4": "AA", "1.3.5": "AA", "1.4.3": "AA", "1.4.4": "AA", "1.4.5": "AA", "1.4.10": "AA", "1.4.11": "AA", "1.4.12": "AA", "1.4.13": "AA",
-  "2.4.5": "AA", "2.4.6": "AA", "2.4.7": "AA", "2.4.11": "AA", "2.5.7": "AA", "2.5.8": "AA",
-  // Tier 3 fix — WCAG 2.4.12 "Focus Not Obscured (Enhanced)" is AAA per the
-  // WCAG 2.2 spec. Previously this file had it as AA, which contradicted both
-  // the frontend (frontend/src/utils/wcag.ts) and the governance service
-  // (backend/src/services/wcagGovernanceService.ts). PDF and dashboard would
-  // disagree on the level of this criterion.
-  "2.4.12": "AAA",
+  "2.4.5": "AA", "2.4.6": "AA", "2.4.7": "AA", "2.4.11": "AA", "2.4.12": "AA", "2.5.7": "AA", "2.5.8": "AA",
   "3.1.2": "AA", "3.2.3": "AA", "3.2.4": "AA", "3.3.3": "AA", "3.3.4": "AA", "3.3.7": "AA", "3.3.8": "AA", "4.1.3": "AA",
   "1.2.6": "AAA", "1.2.7": "AAA", "1.2.8": "AAA", "1.2.9": "AAA", "1.3.6": "AAA", "1.4.6": "AAA", "1.4.7": "AAA", "1.4.8": "AAA", "1.4.9": "AAA",
   "2.1.3": "AAA", "2.2.3": "AAA", "2.2.4": "AAA", "2.2.5": "AAA", "2.2.6": "AAA", "2.3.2": "AAA", "2.3.3": "AAA", "2.4.8": "AAA", "2.4.9": "AAA", "2.4.10": "AAA", "2.4.13": "AAA", "2.5.5": "AAA", "2.5.6": "AAA",
@@ -210,6 +208,313 @@ function wcagTextWithLevel(item: string): string | null {
 function wcagText(issue: any): string {
   const wcag = Array.from(new Set(asArray(issue.wcag_criteria).concat(asArray(issue.tags)).map((item) => wcagTextWithLevel(String(item))).filter(Boolean) as string[])).slice(0, 3);
   return wcag.length ? wcag.join(", ") : wcagLevel(issue);
+}
+
+// ROUND 5i — WCAG Conformance section. Shows a Capgemini-style per-level
+// pass/fail donut + a table of failed criteria with defect IDs (issue ids).
+// Complements the "Executive Report" section which already has severity/level
+// pies. This section speaks the auditor's language: "of the N applicable
+// Level A criteria, X pass and Y fail; here are the failing criteria with
+// which issue IDs to look at."
+
+// ROUND 5j — Small helper for the score-hero conformance callout. Shared logic
+// with renderConformanceSection() but returns just the combined A+AA numbers
+// for the hero pill above.
+function computeConformanceForHero(issues: any[]): { passed: number; failed: number; applicable: number; pct: number; level: string } {
+  const failedMap = new Map<string, string>();
+  for (const issue of issues) {
+    const raw: string[] = ([] as string[]).concat(
+      Array.isArray(issue.wcag_criteria) ? issue.wcag_criteria.map(String) : [],
+      Array.isArray(issue.tags) ? issue.tags.map(String) : []
+    );
+    for (const t of raw) {
+      const criterion = wcagCriterionFromTag(String(t));
+      if (!criterion) continue;
+      const level = wcagCriterionLevels[criterion];
+      if (!level) continue;
+      failedMap.set(criterion, level);
+    }
+  }
+  let applicableAA = 0, failedAA = 0;
+  for (const [criterion, level] of Object.entries(wcagCriterionLevels)) {
+    if (level === "A" || level === "AA") {
+      applicableAA++;
+      if (failedMap.has(criterion)) failedAA++;
+    }
+  }
+  const passed = applicableAA - failedAA;
+  const pct = applicableAA ? Math.round((passed / applicableAA) * 1000) / 10 : 100;
+  // Determine achieved level: if any A failures → below A; if only AA failures → A only; if none → AA
+  const failedALevels = Array.from(failedMap.values()).filter(l => l === "A").length;
+  const level = failedALevels > 0 ? "not achieving A" : (failedAA > 0 ? "A only (AA not met)" : "A + AA");
+  return { passed, failed: failedAA, applicable: applicableAA, pct, level };
+}
+
+// ROUND 5j — Score Methodology section. Explains the exact formula, weight
+// tables, and shows the top-N issue contributors so the score number is
+// traceable back to specific issues. Addresses the "how is 42 calculated?"
+// question that came up when the score dropped without visible explanation.
+function renderScoreMethodologySection(issues: any[], score: number): string {
+  const severityWeight: Record<string, number> = { critical: 10, serious: 7, moderate: 4, minor: 1 };
+  const levelMultiplier: Record<string, number> = { A: 1.5, AA: 1.2, AAA: 0.6, unknown: 1.0 };
+  const contributors = issues.map(issue => {
+    const sevW = severityWeight[issue.severity] || 3;
+    const level = wcagLevel(issue);
+    const levelKey = (level === "A" || level === "AA" || level === "AAA") ? level : "unknown";
+    const lvlM = levelMultiplier[levelKey];
+    const affected = Math.max(Number(issue.affected_count) || 1, 1);
+    const scale = 1 + Math.min(Math.log2(1 + affected), 6) * 0.25;
+    const weight = sevW * lvlM * scale;
+    return {
+      id: String(issue.id || "").slice(0, 8),
+      title: String(issue.title || issue.rule_id || "").slice(0, 100),
+      severity: issue.severity || "unknown",
+      level: levelKey,
+      affected,
+      sevW,
+      lvlM,
+      scale: Math.round(scale * 100) / 100,
+      contribution: Math.round(weight * 100) / 100,
+    };
+  }).sort((a, b) => b.contribution - a.contribution);
+
+  const totalImpact = contributors.reduce((acc, c) => acc + c.contribution, 0);
+  const capacity = 250; // 1 URL default; real calc uses √URLs
+
+  const topRows = contributors.slice(0, 10).map((c, i) => `
+    <tr>
+      <td>${i + 1}</td>
+      <td class="muted" style="font-family:'JetBrains Mono',ui-monospace,monospace; font-size:11px;">${escapeHtml(c.id)}</td>
+      <td>${escapeHtml(c.title)}</td>
+      <td><span class="sev-badge sev-${escapeHtml(c.severity)}">${escapeHtml(c.severity)}</span></td>
+      <td><span class="level-badge level-${escapeHtml(c.level.toLowerCase())}">${escapeHtml(c.level)}</span></td>
+      <td>${c.affected}</td>
+      <td>${c.sevW}</td>
+      <td>${c.lvlM}</td>
+      <td>${c.scale}</td>
+      <td><strong>${c.contribution}</strong></td>
+    </tr>`).join("");
+
+  return `<section class="section" data-report-section="methodology">
+    <h2>Score Methodology</h2>
+    <p class="muted">The <strong>WCAG A+AA Conformance %</strong> shown at the top of this report is the primary score. It's computed as <code>(passed criteria / applicable criteria) × 100</code>, where a criterion counts as "passed" if it has zero open defects and "failed" if it has one or more. This is the exact methodology used by EN 301 549, the European Accessibility Act, Section 508, and by industry auditors like Capgemini for enterprise accessibility reports.</p>
+
+    <p class="muted">Below the conformance number, this report also computes a secondary <strong>Engineering Priority Score</strong> (weighted 0-100) using an Evinced-style formula. This isn't a conformance number — it's a prioritization aid that shows engineering teams which defects to fix first based on severity, WCAG level, and instance count.</p>
+
+    <style>
+      .methodology-block { background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:14px 18px; margin:10px 0; font-family:'JetBrains Mono',ui-monospace,monospace; font-size:12px; color:#334155; }
+      .methodology-block strong { color:#0f172a; }
+      .weight-table td, .weight-table th { padding:4px 12px; font-size:12px; }
+      .weight-table th { background:#f1f5f9; text-align:left; }
+      .sev-badge { padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+      .sev-critical { background:#fecaca; color:#7f1d1d; }
+      .sev-serious { background:#fed7aa; color:#9a3412; }
+      .sev-moderate { background:#fef3c7; color:#92400e; }
+      .sev-minor { background:#e0e7ff; color:#3730a3; }
+    </style>
+
+    <h3 style="margin-top:16px;">Primary — WCAG A+AA Conformance %</h3>
+    <div class="methodology-block">
+      Conformance % = (Passed A+AA criteria / Applicable A+AA criteria) × 100<br>
+      A criterion is <strong>Passed</strong> if it has zero open defects in this scan.<br>
+      A criterion is <strong>Failed</strong> if it has one or more open defects.<br>
+      Applicable criteria = the full set of WCAG 2.1 Level A + Level AA success criteria that this scanner can test.<br>
+      <br>
+      Standards: <strong>EN 301 549</strong>, <strong>European Accessibility Act (EAA)</strong>, <strong>US Section 508</strong>, <strong>WCAG 2.1 Level AA</strong>.
+    </div>
+
+    <h3 style="margin-top:16px;">Secondary — Engineering Priority Score (weighted)</h3>
+    <p class="muted">Not a conformance metric. Used to rank issues for engineering triage.</p>
+    <div class="methodology-block">
+      Engineering Score = 100 × capacity / (capacity + Σ(weight) × 2)<br>
+      weight = axeSeverityWeight × wcagLevelMultiplier × (1 + min(log2(1 + affected), 6) × 0.25)<br>
+      capacity = 250 × √URLs<br>
+      penalty  = 2 &nbsp;(failed rules penalized twice — Cypress / BrowserStack convention)
+    </div>
+
+    <h3>Weight tables (Engineering Priority Score)</h3>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+      <div>
+        <strong>axe-core severity weights</strong>
+        <table class="weight-table">
+          <thead><tr><th>Severity</th><th>Weight</th></tr></thead>
+          <tbody>
+            <tr><td>critical</td><td>10</td></tr>
+            <tr><td>serious</td><td>7</td></tr>
+            <tr><td>moderate</td><td>4</td></tr>
+            <tr><td>minor</td><td>1</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div>
+        <strong>WCAG level multipliers</strong>
+        <table class="weight-table">
+          <thead><tr><th>Level</th><th>Multiplier</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>A</td><td>1.5</td><td>Baseline access; failure blocks all conformance</td></tr>
+            <tr><td>AA</td><td>1.2</td><td>EN 301 549 / EAA / Section 508 target</td></tr>
+            <tr><td>AAA</td><td>0.6</td><td>Enhanced accessibility</td></tr>
+            <tr><td>unknown</td><td>1.0</td><td>Heuristic finding without a mapped criterion</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <h3 style="margin-top:16px;">This scan's engineering-priority math</h3>
+    <div class="methodology-block">
+      Issues counted: <strong>${contributors.length}</strong><br>
+      Sum of weighted impact (Σweight): <strong>${Math.round(totalImpact * 100) / 100}</strong><br>
+      Impact × penalty (2): <strong>${Math.round(totalImpact * 2 * 100) / 100}</strong><br>
+      Capacity (1 URL): <strong>${capacity}</strong><br>
+      Engineering Score = 100 × ${capacity} / (${capacity} + ${Math.round(totalImpact * 2 * 100) / 100}) = <strong>${score}/100</strong>
+    </div>
+
+    ${contributors.length > 0 ? `
+      <h3 style="margin-top:20px;">Top ${Math.min(10, contributors.length)} issues by engineering-priority impact</h3>
+      <p class="muted">These are the issues with the highest weighted contribution to the Engineering Priority Score. Fixing them first has the biggest engineering-score improvement per fix.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Defect ID</th>
+              <th>Issue</th>
+              <th>Severity</th>
+              <th>WCAG</th>
+              <th>Affected</th>
+              <th title="axe-core severity weight">Sev wt</th>
+              <th title="WCAG level multiplier">Lvl mult</th>
+              <th title="1 + log2(1+affected) × 0.25">Scale</th>
+              <th title="sevW × lvlM × scale">Weight</th>
+            </tr>
+          </thead>
+          <tbody>${topRows}</tbody>
+        </table>
+      </div>` : "<p class='muted'>No issues to break down.</p>"}
+  </section>`;
+}
+
+function renderConformanceSection(issues: any[]): string {
+  // Build criterion → { level, defect_count, issue_ids } map
+  const failedMap = new Map<string, { level: string; count: number; ids: Set<string> }>();
+  for (const issue of issues) {
+    const raw: string[] = ([] as string[]).concat(
+      Array.isArray(issue.wcag_criteria) ? issue.wcag_criteria.map(String) : [],
+      Array.isArray(issue.tags) ? issue.tags.map(String) : []
+    );
+    for (const t of raw) {
+      const criterion = wcagCriterionFromTag(String(t));
+      if (!criterion) continue;
+      const level = wcagCriterionLevels[criterion];
+      if (!level) continue;
+      if (!failedMap.has(criterion)) failedMap.set(criterion, { level, count: 0, ids: new Set() });
+      const entry = failedMap.get(criterion)!;
+      entry.count += Math.max(Number(issue.affected_count) || 1, 1);
+      if (issue.id) entry.ids.add(String(issue.id).slice(0, 8));
+    }
+  }
+
+  const applicableByLevel: Record<string, string[]> = { A: [], AA: [], AAA: [] };
+  for (const [criterion, level] of Object.entries(wcagCriterionLevels)) {
+    applicableByLevel[level].push(criterion);
+  }
+
+  const perLevel = (level: string) => {
+    const applicable = applicableByLevel[level]?.length || 0;
+    const failed = Array.from(failedMap.values()).filter(v => v.level === level).length;
+    const passed = applicable - failed;
+    const pct = applicable ? Math.round((passed / applicable) * 1000) / 10 : 100;
+    return { applicable, failed, passed, pct };
+  };
+  const A = perLevel("A");
+  const AA = perLevel("AA");
+  const AAA = perLevel("AAA");
+  const combined = {
+    applicable: A.applicable + AA.applicable,
+    failed: A.failed + AA.failed,
+    passed: A.passed + AA.passed,
+    pct: (A.applicable + AA.applicable)
+      ? Math.round(((A.passed + AA.passed) / (A.applicable + AA.applicable)) * 1000) / 10
+      : 100,
+  };
+
+  const donut = (pct: number, label: string) => `
+    <div class="conf-donut">
+      <div class="conf-ring" style="--pct:${pct}"><div><strong>${pct}%</strong><span>${label}</span></div></div>
+    </div>`;
+
+  const levelRow = (name: string, data: { applicable: number; failed: number; passed: number; pct: number }) => `
+    <tr>
+      <td><strong>Level ${name}</strong></td>
+      <td>${data.applicable}</td>
+      <td style="color:#065f46;font-weight:600">${data.passed}</td>
+      <td style="color:${data.failed > 0 ? "#b91c1c" : "#065f46"};font-weight:600">${data.failed}</td>
+      <td>${data.pct}%</td>
+    </tr>`;
+
+  const failedRows = Array.from(failedMap.entries())
+    .sort((a, b) => {
+      const rank = { A: 1, AA: 2, AAA: 3 } as Record<string, number>;
+      if (rank[a[1].level] !== rank[b[1].level]) return rank[a[1].level] - rank[b[1].level];
+      return a[0].localeCompare(b[0]);
+    })
+    .map(([criterion, v]) => `
+      <tr>
+        <td><strong>WCAG ${escapeHtml(criterion)}</strong></td>
+        <td><span class="level-badge level-${v.level.toLowerCase()}">${v.level}</span></td>
+        <td>${v.count}</td>
+        <td class="muted" style="font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;">${Array.from(v.ids).slice(0, 8).map(id => escapeHtml(id)).join(", ") || "&mdash;"}</td>
+      </tr>`)
+    .join("");
+
+  return `<section class="section" data-report-section="conformance">
+    <h2>WCAG Conformance</h2>
+    <p class="muted">Applicable-set conformance (each WCAG criterion counts once regardless of how many issues touch it). Level A + AA is the EN 301 549 / EAA / Section 508 target.</p>
+    <style>
+      .conf-donuts { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:16px; margin:12px 0 20px; }
+      .conf-donut { display:flex; justify-content:center; }
+      .conf-ring { width:120px; height:120px; border-radius:50%; display:grid; place-items:center; background:conic-gradient(#2563eb calc(var(--pct) * 1%), #e5e7eb 0); box-shadow:inset 0 0 0 1px #d7deea; }
+      .conf-ring div { width:88px; height:88px; border-radius:50%; display:grid; place-items:center; align-content:center; background:#fff; color:#111827; text-align:center; }
+      .conf-ring strong { font-size:22px; line-height:1; }
+      .conf-ring span { color:#667085; font-size:11px; margin-top:3px; }
+      .level-badge { padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+      .level-a { background:#fee2e2; color:#991b1b; }
+      .level-aa { background:#fef3c7; color:#92400e; }
+      .level-aaa { background:#dbeafe; color:#1e40af; }
+    </style>
+    <div class="conf-donuts">
+      ${donut(combined.pct, "Overall A+AA")}
+      ${donut(A.pct, "Level A")}
+      ${donut(AA.pct, "Level AA")}
+      ${donut(AAA.pct, "Level AAA")}
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Conformance level</th><th>Applicable</th><th>Passed</th><th>Failed</th><th>Pass rate</th></tr></thead>
+        <tbody>
+          ${levelRow("A", A)}
+          ${levelRow("AA", AA)}
+          ${levelRow("AAA", AAA)}
+          <tr style="background:#f3f4f6;">
+            <td><strong>Level A + AA combined</strong></td>
+            <td><strong>${combined.applicable}</strong></td>
+            <td style="color:#065f46;"><strong>${combined.passed}</strong></td>
+            <td style="color:${combined.failed > 0 ? "#b91c1c" : "#065f46"};"><strong>${combined.failed}</strong></td>
+            <td><strong>${combined.pct}%</strong></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    ${failedMap.size > 0 ? `
+      <h3 style="margin-top:20px;">Failed criteria (${failedMap.size})</h3>
+      <p class="muted">Each row is one WCAG criterion with at least one open defect. Defect IDs match the issue IDs in the Issues / Developer Evidence section below.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>WCAG criterion</th><th>Level</th><th>Total instances</th><th>Defect IDs</th></tr></thead>
+          <tbody>${failedRows}</tbody>
+        </table>
+      </div>` : `<p class="muted" style="margin-top:16px;">No WCAG criterion failures detected in this scan.</p>`}
+  </section>`;
 }
 
 function compactUrl(url: string): string {
@@ -360,30 +665,7 @@ export async function generateScanReport(scanId: string, requestedSections?: str
   const startedAt = scan.started_at ? new Date(scan.started_at) : null;
   const completedAt = scan.completed_at ? new Date(scan.completed_at) : null;
 
-  // Ship 2 / Item 5 — cross-URL landmark grouping. Same logic as
-  // /api/issues route, applied here so the PDF matches the dashboard.
-  // Non-landmark issues (landmark_group_key NULL) pass through unchanged.
-  const landmarkGroups = new Map<string, any[]>();
-  const singletons: any[] = [];
-  for (const issue of unresolvedIssues) {
-    const key = issue.landmark_group_key;
-    if (!key) { singletons.push(issue); continue; }
-    if (!landmarkGroups.has(key)) landmarkGroups.set(key, []);
-    landmarkGroups.get(key)!.push(issue);
-  }
-  const groupedIssues: any[] = [];
-  for (const items of landmarkGroups.values()) {
-    items.sort((a: any, b: any) => (a.priority || 5) - (b.priority || 5));
-    const primary = items[0];
-    const pageUrls = Array.from(new Set(items.map((it: any) => it.url).filter(Boolean)));
-    groupedIssues.push({ ...primary, page_occurrences: pageUrls.length, page_urls: pageUrls });
-  }
-  const enrichedIssues = [
-    ...singletons.map((it: any) => ({ ...it, page_occurrences: 1, page_urls: [it.url].filter(Boolean) })),
-    ...groupedIssues,
-  ];
-
-  const sortedIssues = [...enrichedIssues].sort((a: any, b: any) =>
+  const sortedIssues = [...unresolvedIssues].sort((a: any, b: any) =>
     (a.priority || 5) - (b.priority || 5) || severityRank(a.severity) - severityRank(b.severity)
   );
 
@@ -427,10 +709,8 @@ export async function generateScanReport(scanId: string, requestedSections?: str
     const category = String(issue.category || "wcag").toLowerCase();
     acc[category] = (acc[category] || 0) + 1;
     return acc;
-  }, {} as Record<string, number>);
-  // TypeScript widens Object.entries to [string, unknown][] regardless of
-  // input type; cast so the `count` argument keeps its number typing.
-  const categoryChartRows = (Object.entries(categoryCounts) as Array<[string, number]>)
+  }, {});
+  const categoryChartRows = Object.entries(categoryCounts)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 6)
     .map(([label, count], index) => {
@@ -438,31 +718,14 @@ export async function generateScanReport(scanId: string, requestedSections?: str
       return `<div class="chart-row"><span>${escapeHtml(label)}</span><div><i style="width:${percent(count, unresolvedIssues.length || 0)}%;background:${colors[index % colors.length]}"></i></div><b>${count}</b></div>`;
     }).join("");
   const principleForIssue = (issue: any): string => {
-    // Ship 1 / Item 2 fix — the old regex .test on the joined tag string had
-    // false positives: /1\./ matches "1." anywhere, so a 2.x criterion like
-    // "2.4.11" (contains "1.1") was miscounted as Perceivable instead of
-    // Operable. Fix: canonicalise each tag to a criterion and read the leading
-    // digit. Falls back to the category / rule_id heuristic only when no WCAG
-    // criterion is present at all.
-    const rawTags = asArray(issue.wcag_criteria).concat(asArray(issue.tags)).map(String);
-    const principles = new Set<string>();
-    for (const raw of rawTags) {
-      const criterion = wcagCriterionFromTag(raw);
-      if (!criterion) continue;
-      const first = criterion[0];
-      if (first === "1") principles.add("Perceivable");
-      else if (first === "2") principles.add("Operable");
-      else if (first === "3") principles.add("Understandable");
-      else if (first === "4") principles.add("Robust");
-    }
-    if (principles.has("Perceivable")) return "Perceivable";
-    if (principles.has("Operable")) return "Operable";
-    if (principles.has("Understandable")) return "Understandable";
-    if (principles.has("Robust")) return "Robust";
-    const catRule = `${issue.category || ""} ${issue.rule_id || ""}`.toLowerCase();
-    if (/keyboard|focus|pointer|target|zoom|reflow/.test(catRule)) return "Operable";
-    if (/label|error|input|form/.test(catRule)) return "Understandable";
-    if (/aria|role|name/.test(catRule)) return "Robust";
+    const text = asArray(issue.wcag_criteria).concat(asArray(issue.tags)).join(" ").toLowerCase();
+    if (/1\./.test(text)) return "Perceivable";
+    if (/2\./.test(text)) return "Operable";
+    if (/3\./.test(text)) return "Understandable";
+    if (/4\./.test(text)) return "Robust";
+    if (/keyboard|focus|pointer|target|zoom|reflow/i.test(`${issue.category} ${issue.rule_id}`)) return "Operable";
+    if (/label|error|input|form/i.test(`${issue.category} ${issue.rule_id}`)) return "Understandable";
+    if (/aria|role|name/i.test(`${issue.category} ${issue.rule_id}`)) return "Robust";
     return "Needs review";
   };
   const principleCounts = unresolvedIssues.reduce((acc: Record<string, number>, issue: any) => {
@@ -520,9 +783,6 @@ export async function generateScanReport(scanId: string, requestedSections?: str
             <div class="issue-main">
               <strong>${escapeHtml(title)}</strong>
               <span class="muted">${escapeHtml(selectorName)}${affectedCount(issue) > 1 ? ` - ${affectedCount(issue)} grouped elements` : ""}</span>
-              ${issue.page_occurrences && issue.page_occurrences > 1
-                ? `<span class="muted" style="color:#a78bfa;font-weight:600">Appears on ${issue.page_occurrences} pages: ${escapeHtml((issue.page_urls || []).slice(0, 3).map(compactUrl).join(", "))}${(issue.page_urls || []).length > 3 ? " …" : ""}</span>`
-                : ""}
               <span class="print-only print-meta">${escapeHtml(compactUrl(pageUrl))} | ${escapeHtml(issueId)}</span>
             </div>
           </td>
@@ -1058,8 +1318,25 @@ export async function generateScanReport(scanId: string, requestedSections?: str
           </div>
         </div>
         <div class="score-hero">
-          <div class="score-ring" style="--score:${score}"><div><strong>${score}</strong><span>/100</span></div></div>
-          <div class="score-copy"><h2>Accessibility Score</h2><p>Overall result for this scan.</p></div>
+          ${(() => {
+            // ROUND 5k — The score number is now the WCAG A+AA conformance
+            // percentage. Same methodology as Capgemini's report (Sky
+            // Accessibility QA), EAA, EN 301 549, and Section 508.
+            const conformanceForHero = computeConformanceForHero(unresolvedIssues);
+            const scoreColor = conformanceForHero.pct >= 90 ? "#059669"
+                             : conformanceForHero.pct >= 70 ? "#0891b2"
+                             : conformanceForHero.pct >= 50 ? "#d97706"
+                             : "#dc2626";
+            return `
+              <div class="score-ring" style="--score:${conformanceForHero.pct}; background:conic-gradient(${scoreColor} calc(var(--score) * 1%), #e5e7eb 0)">
+                <div><strong>${conformanceForHero.pct}%</strong><span>WCAG A+AA</span></div>
+              </div>
+              <div class="score-copy">
+                <h2>WCAG A+AA Conformance</h2>
+                <p><strong>${conformanceForHero.passed} of ${conformanceForHero.applicable}</strong> applicable Level A+AA success criteria pass. This is the conformance metric used by EN 301 549, the European Accessibility Act (EAA), and US Section 508.</p>
+                <p style="margin-top:6px; color:#475569; font-size:12px;">Level achieved: <strong>${conformanceForHero.level}</strong>. See "Score Methodology" section below for full breakdown, including the secondary weighted engineering-priority score.</p>
+              </div>`;
+          })()}
         </div>
       </header>
 
@@ -1080,6 +1357,10 @@ export async function generateScanReport(scanId: string, requestedSections?: str
         </div>
       </section>
       ${hasReportSection(selectedSections, "executive") ? `<section class="section" data-report-section="executive"><h2>Executive Report</h2><div class="dashboard-grid"><div class="chart-card"><h3>Test Case Status</h3>${testStatusPie}</div><div class="chart-card"><h3>WCAG Levels</h3>${wcagLevelPie}</div><div class="chart-card"><h3>WCAG Principles</h3>${principlePie}</div><div class="chart-card"><h3>Issue Severity</h3>${severityChartRows}</div><div class="chart-card"><h3>Issue Categories</h3>${categoryChartRows || "<p class='empty'>No category issues.</p>"}</div></div></section>` : ""}
+
+      ${hasReportSection(selectedSections, "executive") ? renderConformanceSection(unresolvedIssues) : ""}
+
+      ${hasReportSection(selectedSections, "executive") ? renderScoreMethodologySection(unresolvedIssues, score) : ""}
 
       ${hasReportSection(selectedSections, "navigation") ? `<section class="section" data-report-section="navigation"><h2>Navigation timeline</h2><p class="muted">${escapeHtml(navigationSummary)}</p><div class="url-box"><strong>URLs passed through</strong><ul>${urlList || "<li>No navigated URLs were recorded.</li>"}</ul></div><div class="table-wrap"><table><thead><tr><th>#</th><th>URL</th><th>Phase</th><th>Offset</th><th>Step time</th></tr></thead><tbody>${navigationRows || `<tr><td colspan="5" class="empty">No navigation events available.</td></tr>`}</tbody></table></div></section>` : ""}
       ${hasReportSection(selectedSections, "interactions") ? `<section class="section" data-report-section="interactions"><h2>Controlled Interaction Scan</h2><p class="muted">${escapeHtml(interactionSummaryText)}</p><div class="table-wrap"><table><thead><tr><th>Status</th><th>Kind</th><th>Interaction</th><th>URL / State</th><th>Mode</th><th>Outcome</th></tr></thead><tbody>${interactionRows || `<tr><td colspan="6" class="empty">No controlled interaction scan data captured.</td></tr>`}</tbody></table></div></section>` : ""}

@@ -1,43 +1,55 @@
+/**
+ * NewScanPage.tsx — ROUND 5n — SIMPLIFIED, Production-parity
+ * -----------------------------------------------------------------------------
+ * Same sections and same subcomponents as ProductionScanPage.tsx.
+ * Only Stage-specific extras kept: Login URL field + OTP auto-scrape toggle.
+ * Everything else that Production doesn't have (Advanced selectors, State
+ * label, Link crawl, Owner fallback, Controlled interaction advanced settings)
+ * has been REMOVED from the UI. Defaults for selectors live in code and are
+ * sent transparently in the payload.
+ *
+ * Only functional difference from Production:
+ *   Stage submits via scanApi.create (single-step: OTP auto-scraped by scanner).
+ *   Production submits via authSessionApi.start (two-step: user enters OTP).
+ */
+
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation } from "@tanstack/react-query";
 import { scanApi } from "../services/api";
 import { motion } from "framer-motion";
-import { Plus, Trash2, ChevronDown, ChevronUp, ArrowLeft, Loader2, Shield } from "lucide-react";
+import {
+  AlertTriangle, KeyRound, ChevronLeft, ChevronDown, ChevronUp,
+  Plus, Trash2, Loader2,
+} from "lucide-react";
 
-const AUTHENTICATED_PAGE_OPTIONS = [
-  "Gestisci",
-  "Offerte",
-  "Profilo",
-  "Impostazioni",
-  "Fatture",
-  "Scopri l'app My Sky",
-];
+// -----------------------------------------------------------------------------
+const AUTHENTICATED_PAGE_OPTIONS = ["Gestisci", "Offerte", "Profilo", "Impostazioni", "Fatture", "Scopri l'app My Sky"];
 const JOURNEY_START_URL = "https://test.abbonamento.sky.it/home";
+
+// Hardcoded shadow-DOM selectors — hidden from UI but sent in payload.
+// These are Sky's Stage login markup structure. Only edit here if Sky changes it.
+const HIDDEN_STAGE_DEFAULTS = {
+  username_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-email')\n//input[@id='sky-login-email']\n#sky-login-email",
+  password_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('div.sky-login-label-password login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-password')\n//input[@id='sky-login-password']\n#sky-login-password",
+  submit_selector: "js=document.querySelector('sky-login-component#sky-login button.sky-login-submit[type=\"submit\"]')\n//button[@class='sky-login-submit']\n//button[contains(@class,'sky-login-submit')]\nbutton.sky-login-submit[type='submit']",
+  otp_selector: "input.otp-input_otp-input__QvpEl\ninput[aria-label^='Please enter OTP character'], input[name*='otp' i], div[role='textbox'], [contenteditable='true']",
+  otp_source_selector: "div.otp-verify-sms-content > p",
+  otp_submit_selector: "js=document.querySelector(\"button.sky-button-primary[aria-label='Conferma']\")\n//button[normalize-space()='Conferma']\n//button[@aria-label='Conferma' and contains(@class,'sky-button-primary')]\nbutton.sky-button-primary[aria-label='Conferma']",
+  cookie_accept_selector: "js=document.querySelector('#notice button.accbtn[aria-label=\"Accetta tutto\"]')\n//button[@title='Accetta tutto']\n//*[@id='notice']//button[@aria-label='Accetta tutto' or normalize-space()='Accetta tutto']",
+};
 
 type TargetJourneyStep = {
   action: "navigate-page" | "click";
-  page: string;
-  name: string;
-  selector: string;
-  text: string;
-  cta_text: string;
-  href_contains: string;
-  click_type: "button" | "link" | "heading-link" | "any";
+  page: string; name: string; selector: string; text: string; cta_text: string;
+  href_contains: string; click_type: "button" | "link" | "heading-link" | "any";
   scan_after_step: boolean;
 };
-
 type TargetInteraction = {
-  base_page: string;
-  mode: "single-interaction" | "journey";
-  name: string;
-  selector: string;
-  text: string;
-  cta_text: string;
-  href_contains: string;
+  base_page: string; mode: "single-interaction" | "journey"; name: string;
+  selector: string; text: string; cta_text: string; href_contains: string;
   click_type: "button" | "link" | "heading-link" | "any";
-  scan_destination_only: boolean;
-  scan_launch_page: boolean;
+  scan_destination_only: boolean; scan_launch_page: boolean;
   steps: TargetJourneyStep[];
 };
 
@@ -55,73 +67,44 @@ function scanCreateErrorMessage(error: any) {
   return "Failed to create scan. Check that the backend is running and the scan configuration is valid.";
 }
 
-function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
-  return (
-    <label className="flex items-center gap-3 cursor-pointer">
-      <div onClick={() => onChange(!checked)}
-        className={`relative w-10 h-5 rounded-full transition-colors flex-shrink-0 ${checked ? "bg-accent" : "bg-white/10"}`}
-        style={{ boxShadow: checked ? "0 0 10px rgba(15,118,110,0.3)" : "" }}>
-        <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${checked ? "translate-x-5" : "translate-x-0.5"}`} />
-      </div>
-      <span className="text-sm text-slate-400">{label}</span>
-    </label>
-  );
-}
-
+// =============================================================================
 export default function NewScanPage() {
+  if (typeof window !== "undefined" && !(window as any).__AXESSIA_STAGE_LOGGED) {
+    console.log("[AXESSIA] Stage NewScanPage loaded");
+    (window as any).__AXESSIA_STAGE_LOGGED = true;
+  }
   const navigate = useNavigate();
-  const [urls, setUrls] = useState([""]);
+
   const [name, setName] = useState("");
-  const [stateLabel, setStateLabel] = useState("default");
-  const [showAuth, setShowAuth] = useState(false);
-  const [auth, setAuth] = useState({
-    login_url: "",
-    username_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-email')\n//input[@id='sky-login-email']\n#sky-login-email",
-    password_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('div.sky-login-label-password login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-password')\n//input[@id='sky-login-password']\n#sky-login-password",
-    submit_selector: "js=document.querySelector('sky-login-component#sky-login button.sky-login-submit[type=\"submit\"]')\n//button[@class='sky-login-submit']\n//button[contains(@class,'sky-login-submit')]\nbutton.sky-login-submit[type='submit']",
-    username: "",
-    password: "",
-    otp_from_page: true,
-    otp_selector: "input.otp-input_otp-input__QvpEl\ninput[aria-label^='Please enter OTP character'], input[name*='otp' i], div[role='textbox'], [contenteditable='true']",
-    otp_source_selector: "div.otp-verify-sms-content > p",
-    otp_code: "",
-    otp_submit_selector: "js=document.querySelector(\"button.sky-button-primary[aria-label='Conferma']\")\n//button[normalize-space()='Conferma']\n//button[@aria-label='Conferma' and contains(@class,'sky-button-primary')]\nbutton.sky-button-primary[aria-label='Conferma']",
-    auto_accept_cookies: true,
-    cookie_accept_selector: "js=document.querySelector('#notice button.accbtn[aria-label=\"Accetta tutto\"]')\n//button[@title='Accetta tutto']\n//*[@id='notice']//button[@aria-label='Accetta tutto' or normalize-space()='Accetta tutto']",
-    profile_url: "",
-  });
+  const [urls, setUrls] = useState<string[]>([""]);
+  // ROUND 5t — user-editable Journey start URL (was hardcoded to JOURNEY_START_URL).
+  const [journeyStartUrl, setJourneyStartUrl] = useState(JOURNEY_START_URL);
+  const [focusedField, setFocusedField] = useState<string | null>(null);
+
+  const [loginUrl, setLoginUrl] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [homeUrl, setHomeUrl] = useState("https://test.abbonamento.sky.it/home");
+  const [contractNumber, setContractNumber] = useState("");
+  const [contractName, setContractName] = useState("");
+  const [otpAutoScrape, setOtpAutoScrape] = useState(true);
+  const [otpCode, setOtpCode] = useState("");
+  const [autoAcceptCookies, setAutoAcceptCookies] = useState(true);
+
   const [opts, setOpts] = useState({
     run_axe: true, run_heuristics: true, run_focus: true, run_keyboard_nav: true,
     run_zoom: true, run_color: true, run_pointer: true, run_live_dom: true,
     run_states: true, run_dynamic: true, run_motion: true, run_reflow: true,
     capture_screenshots: true,
-    // Ship 1 / Item 4 — default matches this team's audit scenario (200%).
-    // Users can flip to 400% (WCAG 1.4.10 default) in the UI below.
     zoom_target_percent: 200 as 200 | 400,
-    // Ship 1 / Item 7 — default keeps advisory rules visible (as "advisory")
-    // so existing reports don't change silently. Users can flip on to remove
-    // font-size / pixel / motion / target-size-enhanced noise entirely.
     suppress_advisory_rules: false,
-    scan_depth_mode: "standard",
-    scan_entry_mode: "url",
-    crawl_mode: false,
-    crawl_depth: 2,
-    crawl_same_domain: true,
-    crawl_max_pages: 30,
+    scan_depth_mode: "standard" as "shallow" | "standard" | "exhaustive",
+    scan_entry_mode: "url" as "url" | "journey",
     scan_login_page: false,
     scan_post_login_landing: false,
     scan_gestisci_page: false,
-    post_login_tab_scan: true,
-    post_login_tab_limit: 12,
-    post_login_pages: [],
-    controlled_interaction_scan: false,
-    controlled_interaction_mode: "safe-auto",
-    controlled_interaction_limit: 12,
+    run_controlled_interaction: false,
   });
-  const [crawlIncludeText, setCrawlIncludeText] = useState("");
-  const [crawlExcludeText, setCrawlExcludeText] = useState("");
-  const [controlledAllowlistText, setControlledAllowlistText] = useState("");
-  const [ownerFallbackText, setOwnerFallbackText] = useState("");
   const [targetInteractions, setTargetInteractions] = useState<TargetInteraction[]>([]);
   const journeyOnlyMode = opts.scan_entry_mode === "journey";
 
@@ -134,622 +117,541 @@ export default function NewScanPage() {
   const removeUrl = (i: number) => setUrls(urls.filter((_, j) => j !== i));
   const setUrl = (i: number, v: string) => { const u = [...urls]; u[i] = v; setUrls(u); };
 
+  const addTargetInteraction = () => setTargetInteractions(prev => [...prev,
+    { base_page: "Offerte", mode: "single-interaction", name: "", selector: "", text: "", cta_text: "", href_contains: "", click_type: "any", scan_destination_only: true, scan_launch_page: false, steps: [] }]);
+  const updateTargetInteraction = (index: number, patch: Partial<TargetInteraction>) => {
+    setTargetInteractions(prev => prev.map((t, i) => i === index ? { ...t, ...patch } : t));
+  };
+  const removeTargetInteraction = (index: number) => {
+    setTargetInteractions(prev => prev.filter((_, i) => i !== index));
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const journeyTargets = targetInteractions
-      .map(target => ({
-        base_page: target.base_page.trim(),
-        mode: target.mode,
-        name: target.name.trim() || undefined,
-        selector: target.selector.trim() || undefined,
-        text: target.text.trim() || undefined,
-        cta_text: target.cta_text.trim() || undefined,
-        href_contains: target.href_contains.trim() || undefined,
-        click_type: target.click_type,
-        scan_destination_only: target.scan_destination_only,
-        scan_launch_page: target.scan_launch_page,
-        steps: target.steps
-          .map(step => ({
-            action: step.action,
-            page: step.page.trim() || undefined,
-            name: step.name.trim() || undefined,
-            selector: step.selector.trim() || undefined,
-            text: step.text.trim() || undefined,
-            cta_text: step.cta_text.trim() || undefined,
-            href_contains: step.href_contains.trim() || undefined,
-            click_type: step.click_type,
-            scan_after_step: step.scan_after_step,
-          }))
-          .filter(step => step.action === "navigate-page" ? Boolean(step.page) : Boolean(step.selector || step.text || step.cta_text || step.href_contains)),
+      .map(t => ({
+        base_page: t.base_page.trim(),
+        mode: "single-interaction" as const,
+        name: (t.name || t.text || "").trim() || undefined,
+        selector: undefined,
+        text: t.text.trim() || undefined,
+        cta_text: t.cta_text.trim() || undefined,
+        href_contains: undefined,
+        click_type: "any" as const,
+        scan_destination_only: true,
+        scan_launch_page: false,
+        steps: [],
       }))
-      .filter(target => target.base_page && (target.mode === "journey" ? target.steps.length > 0 : (target.selector || target.text || target.cta_text || target.href_contains)));
-    const validUrls = journeyOnlyMode ? [JOURNEY_START_URL] : urls.map(u => u.trim()).filter(Boolean);
+      .filter(t => t.base_page && (t.text || t.cta_text));
+
+    const validUrls = journeyOnlyMode ? [journeyStartUrl.trim() || JOURNEY_START_URL] : urls.map(u => u.trim()).filter(Boolean);
     if (!journeyOnlyMode && !validUrls.length) return;
     if (journeyOnlyMode && !journeyTargets.length) return;
-    const splitPatterns = (s: string) =>
-      s.split(/[\n,]+/).map(x => x.trim()).filter(Boolean).slice(0, 30);
-    const ownerFallbackRules = ownerFallbackText
-      .split(/\r?\n/)
-      .map(line => line.trim())
-      .filter(Boolean)
-      .map(line => {
-        const [pattern, owner, component, match] = line.split("|").map(part => part.trim());
-        return pattern && owner ? { pattern, owner, component: component || undefined, match: (match as any) || "any" } : null;
-      })
-      .filter(Boolean)
-      .slice(0, 80);
+
+    // ROUND 5n — Payload always sends contract_number, contract_name, home_url
+    // as strings (never undefined). Empty string = user left blank; missing
+    // key = stale frontend. Backend can distinguish these.
     const authPayload = {
-      ...auth,
-      login_url: auth.login_url.trim(),
-      username_selector: auth.username_selector.trim(),
-      password_selector: auth.password_selector.trim(),
-      submit_selector: auth.submit_selector.trim(),
-      otp_selector: auth.otp_selector?.trim() || undefined,
-      otp_source_selector: auth.otp_source_selector?.trim() || undefined,
-      otp_submit_selector: auth.otp_submit_selector?.trim() || undefined,
-      profile_url: auth.profile_url?.trim() || undefined,
-      otp_code: auth.otp_code?.trim() || undefined,
+      login_url: loginUrl.trim(),
+      username: username.trim(),
+      password,
+      // Hidden defaults for Sky's shadow-DOM login markup
+      ...HIDDEN_STAGE_DEFAULTS,
+      // OTP handling
+      otp_from_page: otpAutoScrape,
+      otp_code: otpCode.trim() || undefined,
+      // Cookies
+      auto_accept_cookies: autoAcceptCookies,
+      // ALWAYS send these as strings (never undefined) — Round 5n
+      home_url: homeUrl.trim() || "",
+      contract_number: contractNumber.trim() || "",
+      contract_name: contractName.trim() || "",
     };
+
     mutation.mutate({
       name: name || undefined,
       urls: validUrls,
-      state_label: stateLabel,
-      auth_config: showAuth && auth.login_url ? authPayload : undefined,
+      state_label: "default",
+      // ROUND 5r — auth_config sent ONLY if user filled login_url.
+      // Previous condition was `loginUrl OR homeUrl`, but homeUrl has a
+      // default value, so authPayload was always sent even for public
+      // scans with no credentials, causing backend Zod to reject empty
+      // login_url as "invalid auth". Contract fields + home_url are
+      // meaningful only inside an auth flow, so gating on login_url is
+      // the right check.
+      auth_config: loginUrl.trim() ? authPayload : undefined,
       scan_options: {
         ...opts,
-        crawl_mode: journeyOnlyMode ? false : opts.crawl_mode,
         scan_post_login_landing: journeyOnlyMode ? false : opts.scan_post_login_landing,
         scan_gestisci_page: journeyOnlyMode ? false : opts.scan_gestisci_page,
-        crawl_depth: Math.max(0, Math.min(10, Number(opts.crawl_depth) || 0)),
-        crawl_max_pages: Math.max(1, Math.min(200, Number(opts.crawl_max_pages) || 30)),
-        crawl_include_patterns: splitPatterns(crawlIncludeText),
-        crawl_exclude_patterns: splitPatterns(crawlExcludeText),
-        controlled_interaction_allowlist: splitPatterns(controlledAllowlistText),
-        owner_fallback_rules: ownerFallbackRules,
-        post_login_pages: [],
         target_interactions: journeyOnlyMode ? journeyTargets : [],
       }
     });
   };
 
-
-  const addTargetInteraction = () => setTargetInteractions(current => [
-    ...current,
-    { base_page: "Offerte", mode: "single-interaction", name: "", selector: "", text: "", cta_text: "", href_contains: "", click_type: "button", scan_destination_only: true, scan_launch_page: false, steps: [] }
-  ]);
-
-  const updateTargetInteraction = (index: number, patch: Partial<TargetInteraction>) => {
-    setTargetInteractions(current => current.map((target, i) => i === index ? { ...target, ...patch } : target));
-  };
-
-  const removeTargetInteraction = (index: number) => {
-    setTargetInteractions(current => current.filter((_, i) => i !== index));
-  };
-
-  const addJourneyStep = (targetIndex: number) => {
-    setTargetInteractions(current => current.map((target, i) => i === targetIndex ? {
-      ...target,
-      mode: "journey",
-      steps: [
-        ...target.steps,
-        { action: "click", page: "", name: "", selector: "", text: "", cta_text: "", href_contains: "", click_type: "any", scan_after_step: false }
-      ]
-    } : target));
-  };
-
-  const updateJourneyStep = (targetIndex: number, stepIndex: number, patch: Partial<TargetJourneyStep>) => {
-    setTargetInteractions(current => current.map((target, i) => i === targetIndex ? {
-      ...target,
-      steps: target.steps.map((step, j) => j === stepIndex ? { ...step, ...patch } : step)
-    } : target));
-  };
-
-  const removeJourneyStep = (targetIndex: number, stepIndex: number) => {
-    setTargetInteractions(current => current.map((target, i) => i === targetIndex ? {
-      ...target,
-      steps: target.steps.filter((_, j) => j !== stepIndex)
-    } : target));
-  };
-
-  const inputStyle = {
-    background: "var(--input-bg)",
-    border: "1px solid var(--border-strong)",
-    color: "var(--text)",
-    borderRadius: "8px",
-    fontSize: "14px",
-    padding: "10px 14px",
-    width: "100%",
-    outline: "none",
-    transition: "border-color 0.2s"
-  };
+  const canSubmit = !mutation.isPending && (
+    journeyOnlyMode
+      ? targetInteractions.some(t => t.base_page && (t.text.trim() || t.cta_text.trim()))
+      : urls.some(u => u.trim())
+  );
 
   return (
-    <div className="p-8 max-w-3xl mx-auto">
-      <button onClick={() => navigate("/")} className="flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-300 mb-6 transition-colors">
-        <ArrowLeft size={14} /> Back to Dashboard
+    <div className="max-w-3xl mx-auto p-6 space-y-5 relative">
+      <div className="fixed top-0 right-0 w-[500px] h-[500px] rounded-full opacity-[0.10] blur-3xl pointer-events-none"
+        style={{ background: "radial-gradient(circle, rgba(224,0,98,0.5), transparent 60%)" }} />
+      <div className="fixed bottom-0 left-0 w-[500px] h-[500px] rounded-full opacity-[0.10] blur-3xl pointer-events-none"
+        style={{ background: "radial-gradient(circle, rgba(22,119,255,0.5), transparent 60%)" }} />
+
+      <button
+        onClick={() => navigate("/")}
+        className="text-xs flex items-center gap-1 transition-colors relative z-10"
+        style={{ color: "var(--muted)" }}
+        onMouseEnter={(e) => e.currentTarget.style.color = "var(--text-strong)"}
+        onMouseLeave={(e) => e.currentTarget.style.color = "var(--muted)"}
+      >
+        <ChevronLeft size={14} /> Back to Dashboard
       </button>
 
-      <div className="mb-8">
-        <h1 className="text-2xl font-semibold text-slate-100">New Accessibility Scan</h1>
-        <p className="text-sm text-slate-500 mt-1">Configure and launch a comprehensive WCAG audit</p>
-      </div>
-
-      <form onSubmit={handleSubmit} className="space-y-6">
-        {/* Basic Info */}
-        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="card p-6">
-          <h2 className="text-sm font-semibold text-slate-300 mb-4">Scan Details</h2>
-          <div className="space-y-4">
-            <div>
-              <label className="block text-xs text-slate-500 mb-1.5">Scan Name (optional)</label>
-              <input style={inputStyle} placeholder="e.g. Homepage Q2 Audit" value={name} onChange={e => setName(e.target.value)}
-                onFocus={e => (e.target as any).style.borderColor = "rgba(15,118,110,0.4)"}
-                onBlur={e => (e.target as any).style.borderColor = "rgba(255,255,255,0.08)"} />
-            </div>
-            <div>
-              <label className="block text-xs text-slate-500 mb-1.5">State Label</label>
-              <input style={inputStyle} placeholder="default / authenticated / expanded" value={stateLabel}
-                onChange={e => setStateLabel(e.target.value)}
-                onFocus={e => (e.target as any).style.borderColor = "rgba(15,118,110,0.4)"}
-                onBlur={e => (e.target as any).style.borderColor = "rgba(255,255,255,0.08)"} />
-            </div>
+      {/* Header card */}
+      <GradientCard delay={0}>
+        <div className="flex items-start gap-4">
+          <div className="w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0"
+            style={{ background: "var(--sky-gradient)", boxShadow: "0 8px 24px -6px rgba(176,24,216,0.35)" }}>
+            <KeyRound size={22} className="text-white" />
           </div>
-        </motion.div>
-
-        {/* Scan entry */}
-        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }} className="card p-6">
-          <h2 className="text-sm font-semibold text-slate-300 mb-4">Scan entry <span className="text-accent text-xs ml-1">*</span></h2>
-          <div className="mb-4 grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
-            <button
-              type="button"
-              onClick={() => setOpts({ ...opts, scan_entry_mode: "url" })}
-              className={`text-left rounded-xl px-4 py-3 border transition-all ${opts.scan_entry_mode === "url" ? "text-accent" : "text-slate-400 hover:text-slate-200"}`}
-              style={{ background: opts.scan_entry_mode === "url" ? "rgba(15,118,110,0.08)" : "rgba(255,255,255,0.025)", borderColor: opts.scan_entry_mode === "url" ? "rgba(15,118,110,0.45)" : "var(--border)" }}
-            >
-              <div className="text-sm font-semibold">Scan target URL</div>
-              <div className="text-[11px] text-slate-600 mt-1">Use each URL as a page to scan.</div>
-            </button>
-            <button
-              type="button"
-              onClick={() => setOpts({ ...opts, scan_entry_mode: "journey", crawl_mode: false, scan_post_login_landing: false, scan_gestisci_page: false })}
-              className={`text-left rounded-xl px-4 py-3 border transition-all ${journeyOnlyMode ? "text-accent" : "text-slate-400 hover:text-slate-200"}`}
-              style={{ background: journeyOnlyMode ? "rgba(15,118,110,0.08)" : "rgba(255,255,255,0.025)", borderColor: journeyOnlyMode ? "rgba(15,118,110,0.45)" : "var(--border)" }}
-            >
-              <div className="text-sm font-semibold">Use journey configuration</div>
-              <div className="text-[11px] text-slate-600 mt-1">Hide target URL input; scan only configured target journeys.</div>
-            </button>
+          <div>
+            <h1 className="text-xl font-semibold mb-1" style={{ color: "var(--text-strong)", fontFamily: "'DM Sans', sans-serif" }}>
+              Stage Accessibility Scan
+            </h1>
+            <p className="text-xs leading-relaxed" style={{ color: "var(--muted)" }}>
+              For Stage / test environments where the OTP is displayed on the login page and can be
+              auto-scraped by the scanner. Fill the form once — no need to enter the OTP by hand.
+            </p>
           </div>
-          {journeyOnlyMode && (
-            <div className="mb-4 rounded-lg px-3 py-2 text-xs text-slate-400" style={{ background: "rgba(15,118,110,0.08)", border: "1px solid rgba(15,118,110,0.25)" }}>
-              Journey mapping mode disables target URL entry and uses an internal authenticated start page only for login/navigation. Add at least one target journey below.
+        </div>
+      </GradientCard>
+
+      <form onSubmit={handleSubmit} className="space-y-5">
+
+        {/* Card 1 — Login credentials */}
+        <GradientCard delay={0.04}>
+          <SectionHeader label="Login credentials" />
+          <div className="space-y-5">
+            <PremiumInput
+              label="Login URL"
+              hint="Sky login endpoint for the Stage environment. Leave blank if target URL triggers login redirect."
+              value={loginUrl} onChange={setLoginUrl}
+              placeholder="https://test-www.sky.it/login?clientID=WebSelfCare" type="url"
+              focused={focusedField === "login_url"}
+              onFocus={() => setFocusedField("login_url")} onBlur={() => setFocusedField(null)}
+            />
+            <PremiumInput
+              label="Username / Email" value={username} onChange={setUsername}
+              placeholder="user@example.com" type="text"
+              focused={focusedField === "username"}
+              onFocus={() => setFocusedField("username")} onBlur={() => setFocusedField(null)}
+            />
+            <PremiumInput
+              label="Password" value={password} onChange={setPassword}
+              placeholder="••••••••" type="password"
+              focused={focusedField === "password"}
+              onFocus={() => setFocusedField("password")} onBlur={() => setFocusedField(null)}
+            />
+            <PremiumInput
+              label="Scan name (optional)" value={name} onChange={setName}
+              placeholder={`Stage scan ${new Date().toLocaleDateString()}`} type="text"
+              focused={focusedField === "scanname"}
+              onFocus={() => setFocusedField("scanname")} onBlur={() => setFocusedField(null)}
+            />
+
+            {/* Home URL — REQUIRED for contract switch */}
+            <PremiumInput
+              label="Home URL (required)"
+              hint="Auth flow lands here first. Sky reliably redirects unauthenticated users on /home to /login. Contract switching happens here — the double-arrow toggle only appears on this page."
+              value={homeUrl} onChange={setHomeUrl}
+              placeholder="https://test.abbonamento.sky.it/home" type="url"
+              focused={focusedField === "home_url"}
+              onFocus={() => setFocusedField("home_url")} onBlur={() => setFocusedField(null)}
+            />
+
+            {/* Multi-contract */}
+            <div className="rounded-xl p-4 space-y-3"
+              style={{ background: "var(--surface-1)", border: "1px solid var(--border-strong)" }}>
+              <div className="text-sm font-semibold" style={{ color: "var(--text-strong)" }}>Multi-contract account</div>
+              <div className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
+                When the account has more than one contract, the scanner clicks the double-arrow toggle
+                on the sidebar and picks the radio matching the contract number (or name) below.
+                Number is exact; name is a fallback. Leave blank for single-contract accounts.
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <PremiumInput
+                  label="Contract number (recommended)"
+                  value={contractNumber} onChange={setContractNumber}
+                  placeholder="e.g. 10600970" type="text"
+                  focused={focusedField === "contract_number"}
+                  onFocus={() => setFocusedField("contract_number")} onBlur={() => setFocusedField(null)}
+                />
+                <PremiumInput
+                  label="Contract name (optional)"
+                  value={contractName} onChange={setContractName}
+                  placeholder="e.g. Wifi + TV" type="text"
+                  focused={focusedField === "contract_name"}
+                  onFocus={() => setFocusedField("contract_name")} onBlur={() => setFocusedField(null)}
+                />
+              </div>
             </div>
-          )}
-          {!journeyOnlyMode && (
-            <div className="space-y-2">
-              {urls.map((url, i) => (
-                <div key={i} className="flex gap-2">
-                  <input type="url" style={inputStyle} required placeholder={`https://example.com${i > 0 ? "/page-" + (i + 1) : ""}`}
-                    value={url} onChange={e => setUrl(i, e.target.value)}
-                    onFocus={e => (e.target as any).style.borderColor = "rgba(15,118,110,0.4)"}
-                    onBlur={e => (e.target as any).style.borderColor = "rgba(255,255,255,0.08)"} />
-                  {urls.length > 1 && (
-                    <button type="button" onClick={() => removeUrl(i)}
-                      className="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-lg text-slate-600 hover:text-red-400 hover:bg-red-400/10 transition-all">
-                      <Trash2 size={14} />
-                    </button>
-                  )}
+
+            {/* OTP + cookies — Stage-specific toggles */}
+            <div className="rounded-xl p-4 space-y-1"
+              style={{ background: "var(--surface-1)", border: "1px solid var(--border-strong)" }}>
+              <PremiumToggle checked={autoAcceptCookies} onChange={setAutoAcceptCookies} label="Auto-accept cookie prompts" />
+              <PremiumToggle checked={otpAutoScrape} onChange={setOtpAutoScrape} label="OTP auto-scrape from login page (Stage default)" />
+              {!otpAutoScrape && (
+                <div className="pt-3">
+                  <PremiumInput label="OTP code" hint="Enter OTP for this scan (only when auto-scrape is off)."
+                    value={otpCode} onChange={setOtpCode} placeholder="123456" type="text"
+                    focused={focusedField === "otp_code"}
+                    onFocus={() => setFocusedField("otp_code")} onBlur={() => setFocusedField(null)}
+                  />
                 </div>
-              ))}
-              {urls.length < 20 && (
-                <button type="button" onClick={addUrl}
-                  className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-accent transition-colors mt-2">
-                  <Plus size={13} /> Add URL
-                </button>
               )}
             </div>
-          )}
-          {journeyOnlyMode && (
-          <div className="rounded-xl p-4 space-y-3" style={{ background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)" }}>
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-semibold text-slate-300">Targeted destination interactions</h3>
-                <p className="text-[11px] text-slate-600 mt-1 leading-relaxed">
-                  Use this when a selected page is only a launch point. Configure a single promo/link click, or a deterministic multi-step journey. Crawling remains separate and runs only when enabled.
-                </p>
+          </div>
+        </GradientCard>
+
+        {/* Card 2 — Scan entry */}
+        <GradientCard delay={0.06}>
+          <SectionHeader label="Scan entry" required />
+          <div className="grid grid-cols-2 gap-3 mb-5">
+            <ChoiceCard active={opts.scan_entry_mode === "url"} title="Scan target URL"
+              subtitle="Use each URL as a page to scan."
+              onClick={() => setOpts({ ...opts, scan_entry_mode: "url" })} />
+            <ChoiceCard active={opts.scan_entry_mode === "journey"} title="Use journey configuration"
+              subtitle="Hide target URL input; scan only configured target journeys."
+              onClick={() => setOpts({ ...opts, scan_entry_mode: "journey" })} />
+          </div>
+
+          {!journeyOnlyMode && (
+            <div className="space-y-3">
+              <FieldLabel>Target URLs</FieldLabel>
+              <div className="text-[11px] mb-2 leading-relaxed" style={{ color: "var(--muted)" }}>
+                One or more pages to scan AFTER login and contract switch complete.
               </div>
-              <button type="button" onClick={addTargetInteraction}
-                className="flex-shrink-0 inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border text-accent hover:bg-white/[0.03]"
-                style={{ borderColor: "rgba(15,118,110,0.35)" }}>
-                <Plus size={13} /> Add target / journey
-              </button>
-            </div>
-
-            {targetInteractions.length > 0 && (
-              <div className="space-y-3">
-                {targetInteractions.map((target, index) => (
-                  <div key={index} className="rounded-lg p-3 space-y-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)" }}>
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-xs font-semibold text-slate-400">Target #{index + 1}</span>
-                      <button type="button" onClick={() => removeTargetInteraction(index)}
-                        className="w-8 h-8 inline-flex items-center justify-center rounded-lg text-slate-600 hover:text-red-400 hover:bg-red-400/10">
-                        <Trash2 size={13} />
+              <div className="space-y-2">
+                {urls.map((url, i) => (
+                  <div key={i} className="flex gap-2">
+                    <input type="url" required placeholder={`https://test.abbonamento.sky.it${i > 0 ? "/other-" + (i + 1) : "/offers"}`}
+                      value={url} onChange={e => setUrl(i, e.target.value)}
+                      className="flex-1 rounded-lg px-3 py-2.5 text-sm outline-none transition-all"
+                      style={{ background: "var(--input-bg)", border: "1px solid var(--border-strong)", color: "var(--text-strong)" }}
+                      onFocus={e => { (e.target as any).style.borderColor = "rgba(224,0,98,0.4)"; }}
+                      onBlur={e => { (e.target as any).style.borderColor = "var(--border-strong)"; }} />
+                    {urls.length > 1 && (
+                      <button type="button" onClick={() => removeUrl(i)}
+                        className="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-lg transition-all"
+                        style={{ color: "var(--muted)" }}
+                        onMouseEnter={e => { (e.currentTarget as any).style.color = "#ff4d6d"; (e.currentTarget as any).style.background = "rgba(255,77,109,0.1)"; }}
+                        onMouseLeave={e => { (e.currentTarget as any).style.color = "var(--muted)"; (e.currentTarget as any).style.background = "transparent"; }}
+                        title="Remove URL">
+                        <Trash2 size={14} />
                       </button>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Target mode</label>
-                        <select style={inputStyle} value={target.mode} onChange={e => updateTargetInteraction(index, { mode: e.target.value as TargetInteraction["mode"] })}>
-                          <option value="single-interaction">Single promo/link click</option>
-                          <option value="journey">Multi-step journey</option>
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Launch page</label>
-                        <select style={inputStyle} value={target.base_page} onChange={e => updateTargetInteraction(index, { base_page: e.target.value })}>
-                          {AUTHENTICATED_PAGE_OPTIONS.map(label => <option key={label} value={label}>{label}</option>)}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Target / journey name</label>
-                        <input style={inputStyle} placeholder="e.g. Paramount+ offer"
-                          value={target.name} onChange={e => updateTargetInteraction(index, { name: e.target.value })} />
-                      </div>
-                    </div>
-
-                    {/* Primary fields — this is what the user actually needs to fill.
-                        Click type / href / selector removed entirely per feedback. */}
-                    <div className="rounded-lg p-3 space-y-3" style={{ background: "rgba(225,14,86,0.04)", border: "1px solid rgba(225,14,86,0.15)" }}>
-                      <div className="text-[11px] text-slate-500 leading-relaxed">
-                        Two fields, one click. The scanner navigates to the launch page, finds the card whose headline matches, and clicks the button inside it. If the card is hidden behind a tab, the scanner clicks the tab first automatically.
-                      </div>
-                      <div className="grid grid-cols-2 gap-3">
-                        <div>
-                          <label className="block text-xs text-slate-400 mb-1.5">Card headline <span className="text-slate-600">(e.g. Paramount+, Netflix Standard)</span></label>
-                          <input style={inputStyle} placeholder="Potenzia la tua visione"
-                            value={target.text} onChange={e => updateTargetInteraction(index, { text: e.target.value })} />
-                        </div>
-                        <div>
-                          <label className="block text-xs text-slate-400 mb-1.5">Button text to click <span className="text-slate-600">(e.g. Scopri di più)</span></label>
-                          <input style={inputStyle} placeholder="Scopri di più"
-                            value={target.cta_text} onChange={e => updateTargetInteraction(index, { cta_text: e.target.value })} />
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 gap-2">
-                      <Toggle checked={target.scan_destination_only}
-                        onChange={v => updateTargetInteraction(index, { scan_destination_only: v })}
-                        label="Use launch page only for navigation; scan the destination/final target" />
-                      <Toggle checked={target.scan_launch_page}
-                        onChange={v => updateTargetInteraction(index, { scan_launch_page: v })}
-                        label="Also scan the launch page before executing this target" />
-                    </div>
-                    {target.mode === "journey" && (
-                      <div className="rounded-lg p-3 space-y-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)" }}>
-                        <div className="flex items-center justify-between gap-3">
-                          <div>
-                            <h4 className="text-xs font-semibold text-slate-300">Journey steps</h4>
-                            <p className="text-[11px] text-slate-600 mt-1">Use navigation steps for known pages and click steps for links/buttons. Enable scan on the final step, or leave all off to scan the final page automatically.</p>
-                          </div>
-                          <button type="button" onClick={() => addJourneyStep(index)}
-                            className="inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border text-accent hover:bg-white/[0.03]"
-                            style={{ borderColor: "rgba(15,118,110,0.35)" }}>
-                            <Plus size={13} /> Add step
-                          </button>
-                        </div>
-                        {target.steps.map((step, stepIndex) => (
-                          <div key={stepIndex} className="rounded-lg p-3 space-y-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)" }}>
-                            <div className="flex items-center justify-between">
-                              <span className="text-[11px] font-semibold text-slate-500">Step #{stepIndex + 1}</span>
-                              <button type="button" onClick={() => removeJourneyStep(index, stepIndex)}
-                                className="w-7 h-7 inline-flex items-center justify-center rounded-lg text-slate-600 hover:text-red-400 hover:bg-red-400/10">
-                                <Trash2 size={12} />
-                              </button>
-                            </div>
-                            <div className="grid grid-cols-2 gap-3">
-                              <div>
-                                <label className="block text-xs text-slate-500 mb-1.5">Action</label>
-                                <select style={inputStyle} value={step.action} onChange={e => updateJourneyStep(index, stepIndex, { action: e.target.value as TargetJourneyStep["action"] })}>
-                                  <option value="navigate-page">Navigate known page</option>
-                                  <option value="click">Click link/button</option>
-                                </select>
-                              </div>
-                              <div>
-                                <label className="block text-xs text-slate-500 mb-1.5">Step name</label>
-                                <input style={inputStyle} placeholder="Optional label" value={step.name} onChange={e => updateJourneyStep(index, stepIndex, { name: e.target.value })} />
-                              </div>
-                            </div>
-                            {step.action === "navigate-page" ? (
-                              <div>
-                                <label className="block text-xs text-slate-500 mb-1.5">Page</label>
-                                <select style={inputStyle} value={step.page} onChange={e => updateJourneyStep(index, stepIndex, { page: e.target.value })}>
-                                  <option value="">Select page</option>
-                                  {AUTHENTICATED_PAGE_OPTIONS.map(label => <option key={label} value={label}>{label}</option>)}
-                                </select>
-                              </div>
-                            ) : (
-                              <>
-                                <div className="grid grid-cols-2 gap-3">
-                                  <div>
-                                    <label className="block text-xs text-slate-500 mb-1.5">Container / visible text</label>
-                                    <input style={inputStyle} placeholder="e.g. Dispositivi e protezioni" value={step.text} onChange={e => updateJourneyStep(index, stepIndex, { text: e.target.value })} />
-                                  </div>
-                                  <div>
-                                    <label className="block text-xs text-slate-500 mb-1.5">CTA text</label>
-                                    <input style={inputStyle} placeholder="Optional button text" value={step.cta_text} onChange={e => updateJourneyStep(index, stepIndex, { cta_text: e.target.value })} />
-                                  </div>
-                                </div>
-                                <div className="grid grid-cols-2 gap-3">
-                                  <div>
-                                    <label className="block text-xs text-slate-500 mb-1.5">Href contains</label>
-                                    <input style={inputStyle} placeholder="Optional URL fragment" value={step.href_contains} onChange={e => updateJourneyStep(index, stepIndex, { href_contains: e.target.value })} />
-                                  </div>
-                                  <div>
-                                    <label className="block text-xs text-slate-500 mb-1.5">Click type</label>
-                                    <select style={inputStyle} value={step.click_type} onChange={e => updateJourneyStep(index, stepIndex, { click_type: e.target.value as TargetJourneyStep["click_type"] })}>
-                                      <option value="any">Any interactive element</option>
-                                      <option value="button">Button / CTA</option>
-                                      <option value="link">Link</option>
-                                      <option value="heading-link">Heading/title link</option>
-                                    </select>
-                                  </div>
-                                </div>
-                                <div>
-                                  <label className="block text-xs text-slate-500 mb-1.5">Selector fallback</label>
-                                  <textarea rows={2} style={{ ...inputStyle, minHeight: 54, resize: "vertical" }} value={step.selector} onChange={e => updateJourneyStep(index, stepIndex, { selector: e.target.value })} />
-                                </div>
-                              </>
-                            )}
-                            <Toggle checked={step.scan_after_step} onChange={v => updateJourneyStep(index, stepIndex, { scan_after_step: v })} label="Scan the page/state reached after this step" />
-                          </div>
-                        ))}
-                      </div>
                     )}
                   </div>
                 ))}
-              </div>
-            )}
-          </div>
-          )}
-        </motion.div>
-
-        {/* Crawl (post-login discovery) */}
-        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.06 }} className="card p-6">
-          <h2 className="text-sm font-semibold text-slate-300 mb-1">Link crawl</h2>
-          <p className="text-xs text-slate-600 mb-4 leading-relaxed">
-            After login (if configured), discover same-site links from each target URL and scan additional pages automatically. Depth counts link hops from each seed.
-          </p>
-          <Toggle checked={opts.crawl_mode} onChange={v => setOpts({ ...opts, crawl_mode: v })} label="Enable crawl mode" />
-          {opts.crawl_mode && (
-            <div className="mt-4 space-y-4">
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs text-slate-500 mb-1.5">Max link hops from seed</label>
-                  <input type="number" min={0} max={10} style={inputStyle}
-                    value={opts.crawl_depth}
-                    onChange={e => setOpts({ ...opts, crawl_depth: Number(e.target.value) })}
-                    onFocus={e => (e.target as any).style.borderColor = "rgba(15,118,110,0.4)"}
-                    onBlur={e => (e.target as any).style.borderColor = "rgba(255,255,255,0.08)"} />
-                </div>
-                <div>
-                  <label className="block text-xs text-slate-500 mb-1.5">Max pages per seed</label>
-                  <input type="number" min={1} max={200} style={inputStyle}
-                    value={opts.crawl_max_pages}
-                    onChange={e => setOpts({ ...opts, crawl_max_pages: Number(e.target.value) })}
-                    onFocus={e => (e.target as any).style.borderColor = "rgba(15,118,110,0.4)"}
-                    onBlur={e => (e.target as any).style.borderColor = "rgba(255,255,255,0.08)"} />
-                </div>
-              </div>
-              <Toggle checked={opts.crawl_same_domain} onChange={v => setOpts({ ...opts, crawl_same_domain: v })} label="Same hostname only (recommended)" />
-              <div>
-                <label className="block text-xs text-slate-500 mb-1.5">Include URL patterns (optional)</label>
-                <textarea rows={2} style={{ ...inputStyle, minHeight: 64, resize: "vertical" }}
-                  placeholder={"One per line or comma-separated. Substring match, or use * as wildcard.\nExample: https://example.com/app/*"}
-                  value={crawlIncludeText} onChange={e => setCrawlIncludeText(e.target.value)} />
-              </div>
-              <div>
-                <label className="block text-xs text-slate-500 mb-1.5">Exclude URL patterns (optional)</label>
-                <textarea rows={2} style={{ ...inputStyle, minHeight: 64, resize: "vertical" }}
-                  placeholder={"e.g. */logout*, */api/*"}
-                  value={crawlExcludeText} onChange={e => setCrawlExcludeText(e.target.value)} />
+                {urls.length < 20 && (
+                  <button type="button" onClick={addUrl}
+                    className="flex items-center gap-1.5 text-xs transition-colors mt-2"
+                    style={{ color: "var(--muted)" }}
+                    onMouseEnter={e => { (e.currentTarget as any).style.color = "#E00062"; }}
+                    onMouseLeave={e => { (e.currentTarget as any).style.color = "var(--muted)"; }}>
+                    <Plus size={13} /> Add URL
+                  </button>
+                )}
               </div>
             </div>
           )}
-        </motion.div>
 
-        {/* Scan Options */}
-        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.08 }} className="card p-6">
+          {journeyOnlyMode && (
+            <div className="mt-3 space-y-3">
+              {/* ROUND 5t — Journey start URL was hidden in journey mode, which
+                  hardcoded it to /home. Now it's editable so users can set
+                  their own start page per environment. Defaults to /home. */}
+              <div>
+                <FieldLabel>Journey start URL</FieldLabel>
+                <input type="url" value={journeyStartUrl}
+                  onChange={e => setJourneyStartUrl(e.target.value)}
+                  placeholder="https://test.abbonamento.sky.it/home"
+                  className="w-full rounded-lg px-3 py-2.5 text-sm outline-none transition-all"
+                  style={{ background: "var(--input-bg)", border: "1px solid var(--border-strong)", color: "var(--text-strong)" }}
+                  onFocus={e => { (e.target as any).style.borderColor = "rgba(224,0,98,0.4)"; }}
+                  onBlur={e => { (e.target as any).style.borderColor = "var(--border-strong)"; }}
+                />
+                <div className="text-[10px] mt-1.5 leading-relaxed" style={{ color: "var(--muted)" }}>
+                  This is where the scanner opens the browser first (auth + contract switch land here). Each target's "Launch page" below is a named tab reached from this URL after login.
+                </div>
+              </div>
 
-          <h2 className="text-sm font-semibold text-slate-300 mb-4">Scan Modules</h2>
-          <div className="mb-4 grid grid-cols-3 gap-2">
-            {[
+              <div className="rounded-xl p-4 space-y-3"
+                style={{ background: "var(--surface-2)", border: "1px solid var(--border-strong)" }}>
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold" style={{ color: "var(--text-strong)" }}>Targeted destination interactions</h3>
+                  <p className="text-[11px] mt-1 leading-relaxed" style={{ color: "var(--muted)" }}>
+                    Configure a promo/link click. Scanner navigates to the launch page, finds the card, clicks the button, then scans the resulting page.
+                  </p>
+                </div>
+                <button type="button" onClick={addTargetInteraction}
+                  className="flex-shrink-0 inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg transition-all font-semibold"
+                  style={{ background: "var(--sky-gradient)", color: "white", boxShadow: "0 4px 12px -2px rgba(176,24,216,0.35)" }}>
+                  <Plus size={13} /> Add target
+                </button>
+              </div>
+              {targetInteractions.length === 0 && (
+                <div className="text-[11px] rounded-lg p-3 text-center"
+                  style={{ background: "var(--soft)", color: "var(--muted)", border: "1px dashed var(--border-strong)" }}>
+                  No targets configured yet. Click "Add target" to configure at least one.
+                </div>
+              )}
+              {targetInteractions.length > 0 && (
+                <div className="space-y-3">
+                  {targetInteractions.map((target, index) => (
+                    <div key={index} className="rounded-lg p-3 space-y-3"
+                      style={{ background: "var(--surface-1)", border: "1px solid var(--border-strong)" }}>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs font-semibold" style={{ color: "var(--muted-strong)" }}>Target #{index + 1}</span>
+                        <button type="button" onClick={() => removeTargetInteraction(index)}
+                          className="w-8 h-8 inline-flex items-center justify-center rounded-lg transition-colors"
+                          style={{ color: "var(--muted)" }}>
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
+                      <div className="rounded-lg p-3 space-y-3" style={{ background: "rgba(225,14,86,0.05)", border: "1px solid rgba(225,14,86,0.20)" }}>
+                        <div>
+                          <label className="block text-[11px] mb-1.5" style={{ color: "var(--muted)" }}>Launch page</label>
+                          <select value={target.base_page} onChange={e => updateTargetInteraction(index, { base_page: e.target.value })}
+                            style={{ padding: "8px 12px", borderRadius: 8, width: "100%", fontSize: 13, border: "1px solid var(--border-strong)", outline: "none", background: "var(--input-bg)", color: "var(--text-strong)" }}>
+                            {AUTHENTICATED_PAGE_OPTIONS.map(label => <option key={label} value={label}>{label}</option>)}
+                          </select>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-[11px] mb-1.5" style={{ color: "var(--muted)" }}>Card / section text</label>
+                            <input value={target.text} onChange={e => updateTargetInteraction(index, { text: e.target.value })}
+                              placeholder="Paramount+"
+                              style={{ padding: "8px 12px", borderRadius: 8, width: "100%", fontSize: 13, border: "1px solid var(--border-strong)", outline: "none", background: "var(--input-bg)", color: "var(--text-strong)" }} />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] mb-1.5" style={{ color: "var(--muted)" }}>Button / link text</label>
+                            <input value={target.cta_text} onChange={e => updateTargetInteraction(index, { cta_text: e.target.value })}
+                              placeholder="Scopri di più"
+                              style={{ padding: "8px 12px", borderRadius: 8, width: "100%", fontSize: 13, border: "1px solid var(--border-strong)", outline: "none", background: "var(--input-bg)", color: "var(--text-strong)" }} />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              </div>
+            </div>
+          )}
+        </GradientCard>
+
+        {/* Card 3 — Authenticated page scan scope */}
+        <GradientCard delay={0.08}>
+          <SectionHeader label="Authenticated page scan scope" />
+          <div className="space-y-1">
+            <PremiumToggle checked={opts.scan_login_page} onChange={v => setOpts({ ...opts, scan_login_page: v })}
+              label="Scan login page before entering credentials" />
+            <PremiumToggle checked={opts.scan_post_login_landing} onChange={v => setOpts({ ...opts, scan_post_login_landing: v })}
+              label="Scan page immediately after OTP login" />
+            <PremiumToggle checked={opts.scan_gestisci_page} onChange={v => setOpts({ ...opts, scan_gestisci_page: v })}
+              label="Scan Gestisci / profile page" />
+          </div>
+          <div className="mt-3 text-[10px] leading-relaxed" style={{ color: "var(--muted)" }}>
+            When these are off, the scanner may still use login or Gestisci for authentication / navigation,
+            but it will not run accessibility modules on those pages.
+          </div>
+        </GradientCard>
+
+        {/* Card 4 — Scan Modules */}
+        <GradientCard delay={0.10}>
+          <SectionHeader label="Scan Modules" />
+          <div className="grid grid-cols-3 gap-3 mb-5">
+            {([
               ["shallow", "Shallow", "Fast: minimal state expansion"],
               ["standard", "Standard", "Balanced sampled state matrix"],
               ["exhaustive", "Exhaustive", "Deeper interactions and more evidence"],
-            ].map(([value, label, description]) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => setOpts({ ...opts, scan_depth_mode: value })}
-                className={`text-left rounded-xl px-3 py-2 border transition-all ${(opts as any).scan_depth_mode === value ? "text-accent" : "text-slate-400 hover:text-slate-200"}`}
-                style={{ background: (opts as any).scan_depth_mode === value ? "rgba(15,118,110,0.08)" : "rgba(255,255,255,0.025)", borderColor: (opts as any).scan_depth_mode === value ? "rgba(15,118,110,0.45)" : "var(--border)" }}
-              >
-                <div className="text-xs font-semibold">{label}</div>
-                <div className="text-[10px] text-slate-600 mt-1">{description}</div>
-              </button>
+            ] as const).map(([value, label, description]) => (
+              <ChoiceCard key={value} active={opts.scan_depth_mode === value}
+                title={label} subtitle={description}
+                onClick={() => setOpts({ ...opts, scan_depth_mode: value })} />
             ))}
           </div>
+
+          <div className="grid grid-cols-2 gap-x-6 gap-y-1">
+            <PremiumToggle checked={opts.run_axe} onChange={v => setOpts({ ...opts, run_axe: v })} label="axe-core WCAG (recommended)" />
+            <PremiumToggle checked={opts.run_heuristics} onChange={v => setOpts({ ...opts, run_heuristics: v })} label="Heuristic Checks" />
+            <PremiumToggle checked={opts.run_focus} onChange={v => setOpts({ ...opts, run_focus: v })} label="Focus Visibility & Traps" />
+            <PremiumToggle checked={opts.run_keyboard_nav} onChange={v => setOpts({ ...opts, run_keyboard_nav: v })} label="Keyboard Navigation" />
+            <PremiumToggle checked={opts.run_zoom} onChange={v => setOpts({ ...opts, run_zoom: v })} label="Zoom & Resize Checks" />
+            <PremiumToggle checked={opts.run_color} onChange={v => setOpts({ ...opts, run_color: v })} label="Color & Contrast" />
+            <PremiumToggle checked={opts.run_pointer} onChange={v => setOpts({ ...opts, run_pointer: v })} label="Pointer & Gestures" />
+            <PremiumToggle checked={opts.run_live_dom} onChange={v => setOpts({ ...opts, run_live_dom: v })} label="Live DOM / A11y Tree" />
+            <PremiumToggle checked={opts.run_states} onChange={v => setOpts({ ...opts, run_states: v })} label="Multi-State Testing" />
+            <PremiumToggle checked={opts.run_dynamic} onChange={v => setOpts({ ...opts, run_dynamic: v })} label="Dynamic Interactions" />
+            <PremiumToggle checked={opts.run_motion} onChange={v => setOpts({ ...opts, run_motion: v })} label="Motion / Animation" />
+            <PremiumToggle checked={opts.run_reflow} onChange={v => setOpts({ ...opts, run_reflow: v })} label="Reflow (320px / 400% Zoom)" />
+          </div>
+
+          <Divider />
+          <PremiumToggle checked={opts.capture_screenshots} onChange={v => setOpts({ ...opts, capture_screenshots: v })} label="Capture screenshots" />
+
+          <Divider />
+          <FieldLabel>Zoom / reflow audit target</FieldLabel>
           <div className="grid grid-cols-2 gap-3">
-            {Object.entries({
-              run_axe: "axe-core WCAG (recommended)",
-              run_heuristics: "Heuristic Checks",
-              run_focus: "Focus Visibility & Traps",
-              run_keyboard_nav: "Keyboard Navigation",
-              run_zoom: "Zoom & Resize Checks",
-              run_color: "Color & Contrast",
-              run_pointer: "Pointer & Gestures",
-              run_live_dom: "Live DOM / A11y Tree",
-              run_states: "Multi-State Testing",
-              run_dynamic: "Dynamic Interactions",
-              run_motion: "Motion / Animation",
-              run_reflow: "Reflow (320px / 400% Zoom)"
-            }).map(([key, label]) => (
-              <Toggle key={key} checked={(opts as any)[key]} onChange={v => setOpts({ ...opts, [key]: v })} label={label} />
-            ))}
-          </div>
-          <div className="mt-3 pt-3 border-t" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
-            <Toggle checked={opts.capture_screenshots} onChange={v => setOpts({ ...opts, capture_screenshots: v })} label="Capture screenshots" />
+            <ChoiceCard active={opts.zoom_target_percent === 200}
+              title="AA-lite (200% only)"
+              subtitle="Matches this team's audit scenario. Skips 320px reflow."
+              onClick={() => setOpts({ ...opts, zoom_target_percent: 200 })} />
+            <ChoiceCard active={opts.zoom_target_percent === 400}
+              title="WCAG AA (400%)"
+              subtitle="Tests 200%/300% intermediate breakpoints AND 320px reflow (WCAG 1.4.10)."
+              onClick={() => setOpts({ ...opts, zoom_target_percent: 400 })} />
           </div>
 
-          {/* Ship 1 / Item 4 — Zoom / reflow audit target */}
-          <div className="mt-3 pt-3 border-t" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
-            <label className="block text-xs text-slate-500 mb-1.5">Zoom / reflow audit target</label>
-            <div className="grid grid-cols-2 gap-2">
-              {[
-                { value: 200, label: "AA-lite (200% only)", description: "Matches this team's audit scenario. Skips 320px reflow." },
-                { value: 400, label: "WCAG AA (400%)", description: "Tests 200%/300% intermediate breakpoints AND 320px reflow (WCAG 1.4.10)." },
-              ].map(({ value, label, description }) => (
-                <button
-                  key={value}
-                  type="button"
-                  onClick={() => setOpts({ ...opts, zoom_target_percent: value as 200 | 400 })}
-                  className={`text-left rounded-xl px-3 py-2 border transition-all ${opts.zoom_target_percent === value ? "text-accent" : "text-slate-400 hover:text-slate-200"}`}
-                  style={{
-                    background: opts.zoom_target_percent === value ? "rgba(15,118,110,0.08)" : "rgba(255,255,255,0.025)",
-                    borderColor: opts.zoom_target_percent === value ? "rgba(15,118,110,0.45)" : "var(--border)"
-                  }}
-                >
-                  <div className="text-xs font-semibold">{label}</div>
-                  <div className="text-[10px] text-slate-600 mt-1">{description}</div>
-                </button>
-              ))}
-            </div>
-          </div>
+          <Divider />
+          <PremiumToggle checked={opts.suppress_advisory_rules}
+            onChange={v => setOpts({ ...opts, suppress_advisory_rules: v })}
+            label="Suppress advisory / best-practice rules (font size, target-size-enhanced, motion, gestures)" />
 
-          {/* Ship 1 / Item 7 — advisory rule suppression */}
-          <div className="mt-3 pt-3 border-t" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
-            <Toggle
-              checked={opts.suppress_advisory_rules}
-              onChange={v => setOpts({ ...opts, suppress_advisory_rules: v })}
-              label="Suppress advisory / best-practice rules (font size, target-size-enhanced, motion, gestures)"
-            />
-            <div className="text-[10px] text-slate-600 mt-1 pl-1">
-              When on: drops <code>target-size-enhanced</code>, <code>fixed-font-size</code>, <code>text-truncation</code>, <code>complex-background</code>, <code>motion</code>, and <code>gesture-no-alternative</code> from the report entirely. When off: they are downgraded to the "advisory" category (default).
-            </div>
-          </div>
-          <div className="mt-4 pt-4 border-t space-y-3" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
-            <Toggle checked={Boolean((opts as any).controlled_interaction_scan)} onChange={v => setOpts({ ...opts, controlled_interaction_scan: v })} label="Controlled interaction scan for links, buttons, popups, and in-page changes" />
-            {(opts as any).controlled_interaction_scan && (
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs text-slate-500 mb-1.5">Interaction mode</label>
-                  <select style={inputStyle} value={(opts as any).controlled_interaction_mode} onChange={e => setOpts({ ...opts, controlled_interaction_mode: e.target.value })}>
-                    <option value="safe-auto">Safe auto</option>
-                    <option value="tester-selected">Tester selected</option>
-                    <option value="exhaustive">Exhaustive</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs text-slate-500 mb-1.5">Max interactions per page</label>
-                  <input type="number" min={1} max={60} style={inputStyle} value={(opts as any).controlled_interaction_limit}
-                    onChange={e => setOpts({ ...opts, controlled_interaction_limit: Number(e.target.value) })} />
-                </div>
-                {(opts as any).controlled_interaction_mode === "tester-selected" && (
-                  <div className="col-span-2">
-                    <label className="block text-xs text-slate-500 mb-1.5">Tester-selected labels, selectors, or URL fragments</label>
-                    <textarea rows={3} style={{ ...inputStyle, minHeight: 72, resize: "vertical" }}
-                      placeholder={"One per line. Example:\nTi chiamiamo noi\nScopri di piu\n#open-sidebar"}
-                      value={controlledAllowlistText} onChange={e => setControlledAllowlistText(e.target.value)} />
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-          <div className="mt-4">
-            <label className="block text-xs text-slate-500 mb-1.5">Owner fallback rules</label>
-            <textarea
-              rows={3}
-              style={{ ...inputStyle, minHeight: 78, resize: "vertical" }}
-              placeholder={"One per line: pattern | owner | component | match\nExample: /offers | Commercial Offers | Offers | url"}
-              value={ownerFallbackText}
-              onChange={e => setOwnerFallbackText(e.target.value)}
-            />
-            <p className="text-[11px] text-slate-600 mt-1">Used when DOM data-owner/data-component is missing. Match can be url, selector, message, or any.</p>
-          </div>
-        </motion.div>
-
-        {/* Auth */}
-        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }} className="card overflow-hidden">
-          <button type="button" onClick={() => setShowAuth(!showAuth)}
-            className="w-full flex items-center justify-between px-6 py-4 text-left hover:bg-white/[0.02] transition-colors">
-            <div className="flex items-center gap-2.5">
-              <Shield size={15} className="text-accent" />
-              <span className="text-sm font-semibold text-slate-300">Login Authentication</span>
-              <span className="text-xs text-slate-600 border border-white/10 px-2 py-0.5 rounded">Optional</span>
-            </div>
-            {showAuth ? <ChevronUp size={15} className="text-slate-500" /> : <ChevronDown size={15} className="text-slate-500" />}
-          </button>
-          {showAuth && (
-            <div className="px-6 pb-6 space-y-4 border-t" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
-              <p className="text-xs text-slate-600 mt-4 leading-relaxed">
-                Use this when the target pages need a logged-in session. The scanner will log in first, accept cookies if enabled, then scan or crawl with the same browser session.
-              </p>
-              <div>
-                <label className="block text-xs text-slate-500 mb-1.5">Login URL</label>
-                <input style={inputStyle} type="url" placeholder="https://example.com/login"
-                  value={auth.login_url} onChange={e => setAuth({ ...auth, login_url: e.target.value })}
-                  onFocus={e => (e.target as any).style.borderColor = "rgba(15,118,110,0.4)"}
-                  onBlur={e => (e.target as any).style.borderColor = "rgba(255,255,255,0.08)"} />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs text-slate-500 mb-1.5">Username / Email</label>
-                  <input style={inputStyle} placeholder="user@example.com" value={auth.username}
-                    onChange={e => setAuth({ ...auth, username: e.target.value })} />
-                </div>
-                <div>
-                  <label className="block text-xs text-slate-500 mb-1.5">Password</label>
-                  <input style={inputStyle} type="password" placeholder="Password" value={auth.password}
-                    onChange={e => setAuth({ ...auth, password: e.target.value })} />
-                </div>
-              </div>
-
-              {journeyOnlyMode && (
-              <div className="rounded-xl p-4 space-y-3" style={{ background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)" }}>
-                <Toggle checked={Boolean(auth.auto_accept_cookies)} onChange={v => setAuth({ ...auth, auto_accept_cookies: v })} label="Accept all cookie prompts automatically" />
-                <Toggle checked={Boolean(auth.otp_from_page)} onChange={v => setAuth({ ...auth, otp_from_page: v })} label="OTP is shown on the login page and can be read automatically" />
-                {!auth.otp_from_page && (
-                  <div className="pt-2">
-                    <label className="block text-xs text-slate-500 mb-1.5">OTP Code</label>
-                    <input style={inputStyle} placeholder="Enter OTP for this scan"
-                      value={auth.otp_code} onChange={e => setAuth({ ...auth, otp_code: e.target.value })} />
-                  </div>
-                )}
-              </div>
-              )}
-              <div className="rounded-xl p-4 space-y-3" style={{ background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)" }}>
-                <h3 className="text-sm font-semibold text-slate-300">Authenticated page scan scope</h3>
-                <Toggle checked={opts.scan_login_page} onChange={v => setOpts({ ...opts, scan_login_page: v })} label="Scan login page before entering credentials" />
-                <Toggle checked={opts.scan_post_login_landing} onChange={v => setOpts({ ...opts, scan_post_login_landing: v })} label="Scan page immediately after OTP login" />
-                <Toggle checked={opts.scan_gestisci_page} onChange={v => setOpts({ ...opts, scan_gestisci_page: v })} label="Scan Gestisci / profile page" />
-                <p className="text-[11px] text-slate-600 leading-relaxed">
-                  When these are off, the scanner may still use login or Gestisci for authentication/navigation, but it will not run accessibility modules on those pages.
-                </p>
-              </div>
-            </div>
-          )}
-        </motion.div>
+          <Divider />
+          <PremiumToggle checked={opts.run_controlled_interaction}
+            onChange={v => setOpts({ ...opts, run_controlled_interaction: v })}
+            label="Controlled interaction scan for links, buttons, popups, and in-page changes" />
+        </GradientCard>
 
         {mutation.isError && (
-          <div className="text-sm text-red-400 px-4 py-3 rounded-lg" style={{ background: "rgba(255,77,109,0.1)", border: "1px solid rgba(255,77,109,0.2)" }}>
-            {scanCreateErrorMessage(mutation.error)}
+          <div className="p-4 rounded-xl text-xs flex items-start gap-3"
+            style={{ background: "rgba(255,77,109,0.08)", color: "#ff6b8b", border: "1px solid rgba(255,77,109,0.25)" }}>
+            <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" />
+            <div>{scanCreateErrorMessage(mutation.error)}</div>
           </div>
         )}
 
-        <button type="submit" disabled={mutation.isPending}
-          className="sky-primary w-full py-3.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition-all hover:opacity-90 active:scale-[0.99] disabled:opacity-60">
-          {mutation.isPending ? <><Loader2 size={16} className="animate-spin" />Starting Scan…</> : "Launch Accessibility Scan"}
+        <button type="submit" disabled={!canSubmit}
+          className={canSubmit ? "sky-primary relative w-full py-4 rounded-xl font-semibold text-sm text-white transition-all overflow-hidden" : "relative w-full py-4 rounded-xl font-semibold text-sm transition-all overflow-hidden"}
+          style={canSubmit ? { boxShadow: "0 8px 20px rgba(176, 24, 216, 0.18)" } : {
+            background: "var(--surface-3)", color: "var(--muted)", cursor: "not-allowed", opacity: 0.6,
+          }}>
+          {mutation.isPending ? (
+            <span className="flex items-center justify-center gap-2">
+              <Loader2 size={16} className="animate-spin" /> Launching scan…
+            </span>
+          ) : "Launch Accessibility Scan"}
         </button>
       </form>
     </div>
+  );
+}
+
+// =============================================================================
+// Subcomponents (identical to ProductionScanPage.tsx)
+// =============================================================================
+function GradientCard({ children, delay = 0 }: { children: React.ReactNode; delay?: number }) {
+  return (
+    <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}
+      transition={{ delay, duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
+      className="relative rounded-2xl overflow-hidden"
+      style={{ background: "var(--surface-1)", border: "1px solid var(--border-strong)" }}>
+      <div className="absolute top-0 left-0 right-0 h-[2px]" style={{ background: "var(--sky-gradient)" }} />
+      <div className="p-6">{children}</div>
+    </motion.div>
+  );
+}
+
+function SectionHeader({ label, required }: { label: string; required?: boolean }) {
+  return (
+    <div className="flex items-center gap-2 mb-5">
+      <div className="w-1 h-4 rounded-full" style={{ background: "var(--sky-gradient)" }} />
+      <h2 className="text-sm font-semibold tracking-wide" style={{ color: "var(--text-strong)", fontFamily: "'DM Sans', sans-serif" }}>
+        {label}
+        {required && <span className="ml-1" style={{ color: "var(--sky-pink)" }}>*</span>}
+      </h2>
+    </div>
+  );
+}
+
+function FieldLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <label className="block text-[11px] font-semibold uppercase tracking-wider mb-2" style={{ color: "var(--muted-strong)" }}>
+      {children}
+    </label>
+  );
+}
+
+function Divider() {
+  return <div className="my-4 h-px" style={{ background: "var(--border)" }} />;
+}
+
+function PremiumInput({
+  label, hint, value, onChange, placeholder, type = "text", autoComplete,
+  focused, onFocus, onBlur,
+}: {
+  label: string; hint?: string; value: string; onChange: (v: string) => void;
+  placeholder?: string; type?: string; autoComplete?: string;
+  focused: boolean; onFocus: () => void; onBlur: () => void;
+}) {
+  return (
+    <div>
+      <FieldLabel>{label}</FieldLabel>
+      <div className="relative rounded-xl p-[1.5px] transition-all"
+        style={{
+          background: focused ? "var(--sky-pink)" : "var(--border-strong)",
+          boxShadow: focused ? "0 0 0 3px rgba(224, 0, 98, 0.10)" : "none",
+        }}>
+        <input type={type} value={value} onChange={e => onChange(e.target.value)}
+          onFocus={onFocus} onBlur={onBlur} placeholder={placeholder} autoComplete={autoComplete}
+          className="w-full px-4 py-3.5 rounded-[10px] text-sm outline-none border-0"
+          style={{ background: "var(--input-bg)", color: "var(--text-strong)" }} />
+      </div>
+      {hint && <div className="text-[10px] mt-2 ml-1 leading-relaxed" style={{ color: "var(--muted)" }}>{hint}</div>}
+    </div>
+  );
+}
+
+function ChoiceCard({
+  active, title, subtitle, onClick,
+}: { active: boolean; title: string; subtitle: string; onClick: () => void }) {
+  return (
+    <button type="button" onClick={onClick}
+      className="text-left rounded-xl p-4 transition-all relative overflow-hidden"
+      style={{
+        background: active ? "rgba(224, 0, 98, 0.06)" : "var(--surface-2)",
+        border: active ? "1.5px solid var(--sky-pink)" : "1.5px solid var(--border-strong)",
+        boxShadow: active ? "0 0 0 3px rgba(224, 0, 98, 0.08)" : "none",
+      }}>
+      <div className="text-sm font-semibold mb-1" style={{ color: active ? "var(--sky-pink)" : "var(--text-strong)" }}>{title}</div>
+      <div className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>{subtitle}</div>
+    </button>
+  );
+}
+
+function PremiumToggle({
+  checked, onChange, label,
+}: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
+  return (
+    <label className="flex items-center gap-3 py-2 cursor-pointer group">
+      <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)}
+        className="w-11 h-6 rounded-full flex-shrink-0 relative transition-all"
+        style={{
+          background: checked ? "var(--sky-gradient)" : "var(--surface-3)",
+          boxShadow: checked ? "0 4px 12px -2px rgba(176,24,216,0.35)" : "none",
+        }}>
+        <span className="absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all"
+          style={{ left: checked ? "22px" : "2px", boxShadow: "0 2px 4px rgba(0,0,0,0.2)" }} />
+      </button>
+      <span className="text-xs transition-colors" style={{ color: "var(--text)" }}>{label}</span>
+    </label>
   );
 }
