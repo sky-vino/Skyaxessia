@@ -599,7 +599,7 @@ function procedureCoverageHtml(steps: any[]): string {
     acc[step.coverageType] = (acc[step.coverageType] || 0) + 1;
     acc[step.status] = (acc[step.status] || 0) + 1;
     return acc;
-  }, {});
+  }, {} as Record<string, number>);
   const badges = `
     <div class="coverage-summary">
       <span>Automated ${counts.automated || 0}</span>
@@ -709,11 +709,11 @@ export async function generateScanReport(scanId: string, requestedSections?: str
     const category = String(issue.category || "wcag").toLowerCase();
     acc[category] = (acc[category] || 0) + 1;
     return acc;
-  }, {});
-  const categoryChartRows = Object.entries(categoryCounts)
+  }, {} as Record<string, number>);
+  const categoryChartRows = (Object.entries(categoryCounts) as Array<[string, number]>)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 6)
-    .map(([label, count], index) => {
+    .map(([label, count]: [string, number], index) => {
       const colors = ["#0f766e", "#7c3aed", "#ff4d6d", "#ff9f43", "#ffd60a", "#0891b2"];
       return `<div class="chart-row"><span>${escapeHtml(label)}</span><div><i style="width:${percent(count, unresolvedIssues.length || 0)}%;background:${colors[index % colors.length]}"></i></div><b>${count}</b></div>`;
     }).join("");
@@ -732,7 +732,7 @@ export async function generateScanReport(scanId: string, requestedSections?: str
     const principle = principleForIssue(issue);
     acc[principle] = (acc[principle] || 0) + 1;
     return acc;
-  }, {});
+  }, {} as Record<string, number>);
   const principleItems = ["Perceivable", "Operable", "Understandable", "Robust", "Needs review"].map((label, index) => {
     const colors = ["#ff4d6d", "#ff9f43", "#a78bfa", "#0f766e", "#94a3b8"];
     return { label, count: principleCounts[label] || 0, color: colors[index] };
@@ -838,7 +838,7 @@ export async function generateScanReport(scanId: string, requestedSections?: str
     acc[state][issue.severity || "minor"] = (acc[state][issue.severity || "minor"] || 0) + 1;
     if (issue.evidence_screenshot) acc[state].screenshots += 1;
     return acc;
-  }, {});
+  }, {} as Record<string, any>);
   configuredStates.forEach(state => { stateBreakdown[state] ||= { total: 0, critical: 0, serious: 0, moderate: 0, minor: 0, screenshots: 0 }; });
   const stateEntries = Object.entries(stateBreakdown).sort((a: any, b: any) => b[1].total - a[1].total || a[0].localeCompare(b[0]));
   const stateColors = ["#7c3aed", "#e11d48", "#ff9f43", "#0f766e", "#0891b2", "#a78bfa", "#64748b", "#ffd60a", "#f97316", "#14b8a6"];
@@ -903,7 +903,7 @@ export async function generateScanReport(scanId: string, requestedSections?: str
     const summary = entry.tree.summary || {};
     for (const [key, value] of Object.entries(summary)) acc[key] = (acc[key] || 0) + Number(value || 0);
     return acc;
-  }, {});
+  }, {} as Record<string, number>);
   const interactionSummaryText = Object.keys(interactionSummary).length
     ? Object.entries(interactionSummary).map(([key, value]) => `${value} ${key}`).join(", ")
     : "No controlled interaction scan data captured.";
