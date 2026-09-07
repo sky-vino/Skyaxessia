@@ -18,6 +18,7 @@ const logger_1 = require("./utils/logger");
 const errorHandler_1 = require("./middleware/errorHandler");
 const auth_1 = require("./routes/auth");
 const scans_1 = require("./routes/scans");
+const mobileScans_1 = require("./routes/mobileScans");
 const issues_1 = require("./routes/issues");
 const projects_1 = require("./routes/projects");
 const users_1 = require("./routes/users");
@@ -63,6 +64,7 @@ app.use((0, morgan_1.default)("combined", { stream: { write: msg => logger_1.log
 // ─── API routes ─────────────────────────────────────────────────────────────
 app.use("/api/auth", auth_1.authRouter);
 app.use("/api/scans", scans_1.scanRouter);
+app.use("/api/mobile-scans", mobileScans_1.mobileScanRouter);
 app.use("/api/issues", issues_1.issueRouter);
 app.use("/api/projects", projects_1.projectRouter);
 app.use("/api/users", users_1.userRouter);

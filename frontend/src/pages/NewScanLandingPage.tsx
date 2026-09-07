@@ -1,6 +1,6 @@
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { FlaskConical, Shield, ArrowRight } from "lucide-react";
+import { FlaskConical, Shield, ArrowRight, Smartphone } from "lucide-react";
 
 /**
  * Landing page shown when the user clicks "New Scan" in the sidebar.
@@ -84,6 +84,45 @@ export default function NewScanLandingPage() {
           Stage is fully automated; Production requires you to enter a real OTP interactively.
         </p>
       </motion.div>
+
+      {/* Web / Mobile scan selector */}
+      <div className="flex justify-center mb-8">
+        <div
+          className="inline-flex rounded-xl p-1"
+          style={{
+            background: "var(--surface-1)",
+            border: "1px solid var(--border-strong)",
+            boxShadow: "0 4px 14px rgba(0,0,0,0.06)",
+          }}
+        >
+          <button
+            type="button"
+            className="px-6 py-2.5 rounded-lg text-sm font-semibold transition-all"
+            style={{
+              background: "var(--sky-gradient)",
+              color: "white",
+              boxShadow: "0 4px 12px rgba(176,24,216,0.22)",
+            }}
+          >
+            Web Scan
+          </button>
+
+          <button
+            type="button"
+            onClick={() => navigate("/scans/new/app/mobile")}
+            className="px-6 py-2.5 rounded-lg text-sm font-semibold transition-all"
+            style={{
+              background: "transparent",
+              color: "var(--muted-strong)",
+            }}
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <Smartphone size={14} />
+              Mobile Scan
+            </span>
+          </button>
+        </div>
+      </div>
 
       <div className="grid gap-5 md:grid-cols-2">
         {cards.map((card, idx) => {
