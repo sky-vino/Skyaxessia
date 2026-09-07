@@ -14,7 +14,6 @@ import { logger } from "./utils/logger";
 import { errorHandler } from "./middleware/errorHandler";
 import { authRouter } from "./routes/auth";
 import { scanRouter } from "./routes/scans";
-import { mobileScanRouter } from "./routes/mobileScans";
 import { issueRouter } from "./routes/issues";
 import { projectRouter } from "./routes/projects";
 import { userRouter } from "./routes/users";
@@ -70,7 +69,6 @@ app.use(
 // ─── API routes ─────────────────────────────────────────────────────────────
 app.use("/api/auth", authRouter);
 app.use("/api/scans", scanRouter);
-app.use("/api/mobile-scans", mobileScanRouter);
 app.use("/api/issues", issueRouter);
 app.use("/api/projects", projectRouter);
 app.use("/api/users", userRouter);

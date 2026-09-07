@@ -5,8 +5,6 @@ import DashboardPage from "./pages/DashboardPage";
 import ScanDetailPage from "./pages/ScanDetailPage";
 import NewScanPage from "./pages/NewScanPage";
 import NewScanLandingPage from "./pages/NewScanLandingPage";
-import MobileScanPage from "./pages/MobileScanPage";
-import MobileStageScanPage from "./pages/MobileStageScanPage";
 import ProductionScanPage from "./pages/ProductionScanPage";
 import HistoryPage from "./pages/HistoryPage";
 import UsersPage from "./pages/UsersPage";
@@ -32,8 +30,6 @@ export default function App() {
         {/* Stage form moved to /scans/new/stage. */}
         {/* Production interactive OTP flow at /scans/production (existing page). */}
         <Route path="scans/new" element={<NewScanLandingPage />} />
-        <Route path="scans/new/app/mobile" element={<MobileScanPage />} />
-        <Route path="scans/new/app/mobile/stage" element={<MobileStageScanPage />} />
         <Route path="scans/new/stage" element={<NewScanPage />} />
         <Route path="scans/production" element={<ProductionScanPage />} />
         <Route path="scans/:id" element={<ScanDetailPage />} />
